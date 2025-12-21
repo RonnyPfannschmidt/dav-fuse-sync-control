@@ -1,5 +1,6 @@
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    ReplyXattr,
 };
 use libc::ENOENT;
 use std::collections::HashMap;
@@ -165,8 +166,8 @@ impl Filesystem for DavFS {
         // Try to list parent directory to find this entry
         let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
         
-        // Try cache first, then fetch from server
-        let entries = if let Some(cached) = self.dir_cache.get(&parent_path) {
+        // Try stale cache first for instant response, then fetch if needed
+        let entries = if let Some(cached) = self.dir_cache.get_stale(&parent_path) {
             cached
         } else {
             match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
@@ -228,8 +229,8 @@ impl Filesystem for DavFS {
         // List parent to find this entry
         let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
         
-        // Try cache first, then fetch from server
-        let entries = if let Some(cached) = self.dir_cache.get(parent_path) {
+        // Try stale cache first for instant response, then fetch if needed
+        let entries = if let Some(cached) = self.dir_cache.get_stale(parent_path) {
             cached
         } else {
             match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
@@ -290,9 +291,9 @@ impl Filesystem for DavFS {
             &dir_path[1..]
         };
         
-        // Try cache first, then fetch from server
-        let dav_entries = if let Some(cached) = self.dir_cache.get(&dir_path) {
-            tracing::debug!("Using cached entries for path {}", dir_path);
+        // Try stale cache first for instant response, then fetch if needed
+        let dav_entries = if let Some(cached) = self.dir_cache.get_stale(&dir_path) {
+            tracing::debug!("Using cached (possibly stale) entries for path {}", dir_path);
             cached
         } else {
             match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
@@ -365,5 +366,78 @@ impl Filesystem for DavFS {
         tracing::debug!("open: ino={}", ino);
         // Allow opening files, but read will fail
         reply.opened(0, 0);
+    }
+
+    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        tracing::debug!("listxattr: ino={}, size={}", ino, size);
+        
+        // We expose user.davfs.state xattr
+        let xattr_name = "user.davfs.state";
+        let total_size = xattr_name.len() + 1; // +1 for null terminator
+        
+        if size == 0 {
+            // Return size needed
+            reply.size(total_size as u32);
+        } else if size >= total_size as u32 {
+            // Return the list of xattr names
+            let mut buffer = Vec::with_capacity(total_size);
+            buffer.extend_from_slice(xattr_name.as_bytes());
+            buffer.push(0); // null terminator
+            reply.data(&buffer);
+        } else {
+            reply.error(libc::ERANGE);
+        }
+    }
+
+    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        tracing::debug!("getxattr: ino={}, name={:?}, size={}", ino, name, size);
+        
+        if name != "user.davfs.state" {
+            reply.error(libc::ENODATA);
+            return;
+        }
+        
+        let path = match self.get_path(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        
+        // Determine state based on cache
+        let state = if ino == ROOT_INO {
+            // Root is always cached
+            "cached"
+        } else if path.ends_with('/') || self.dir_cache.get_stale(&path).is_some() {
+            // Directory with cached listing
+            "cached"
+        } else {
+            // Check if parent directory is cached (which means we know about this entry)
+            let parent_path = if let Some(idx) = path.rfind('/') {
+                if idx == 0 { "/" } else { &path[..idx] }
+            } else {
+                "/"
+            };
+            
+            if self.dir_cache.get_stale(parent_path).is_some() {
+                // Parent is cached, so metadata is known but file content is not downloaded
+                "cloud"
+            } else {
+                // Not in cache at all
+                "unknown"
+            }
+        };
+        
+        let value = state.as_bytes();
+        
+        if size == 0 {
+            // Return size needed
+            reply.size(value.len() as u32);
+        } else if size >= value.len() as u32 {
+            reply.data(value);
+        } else {
+            reply.error(libc::ERANGE);
+        }
     }
 }

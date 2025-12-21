@@ -39,6 +39,24 @@ impl DirectoryCache {
         
         None
     }
+    
+    pub fn get_stale(&self, path: &str) -> Option<Vec<DavEntry>> {
+        // Return cached data even if stale - for fast responses
+        let entries = self.entries.lock().unwrap();
+        
+        if let Some(cached) = entries.get(path) {
+            let age = cached.cached_at.elapsed();
+            if age < self.ttl {
+                tracing::debug!("Cache hit (fresh) for path: {}", path);
+            } else {
+                tracing::debug!("Cache hit (stale, age={:?}) for path: {}", age, path);
+            }
+            return Some(cached.entries.clone());
+        }
+        
+        tracing::debug!("Cache miss for path: {}", path);
+        None
+    }
 
     pub fn insert(&self, path: String, entries: Vec<DavEntry>) {
         let mut cache = self.entries.lock().unwrap();

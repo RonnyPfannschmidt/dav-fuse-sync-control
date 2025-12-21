@@ -1,0 +1,6 @@
+[env]
+PKG_CONFIG_PATH = "/usr/lib64/pkgconfig"
+
+[build]
+# Use debug builds by default for local development
+# Only use --release when explicitly needed
