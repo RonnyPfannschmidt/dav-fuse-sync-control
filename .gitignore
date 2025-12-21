@@ -1,0 +1,17 @@
+# Ignore build outputs
+/target/
+Cargo.lock
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local test files
+/test-mount/

@@ -2,6 +2,17 @@
 
 WebDAV Virtual Filesystem with Offline Sync
 
+## Proof of Concept
+
+A working PoC is available! See [POC.md](POC.md) for instructions.
+
+The PoC demonstrates:
+- WebDAV server connection and directory listing
+- Configuration storage in Secret Service (GNOME Keyring/KWallet)
+- FUSE filesystem mounting (read-only)
+- Foreground CLI operation
+- Network error simulation for file reads
+
 ## Documentation
 
 The project specification has been organized into the [spec/](spec/) directory:

@@ -1,0 +1,47 @@
+[package]
+name = "davfs-sync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# FUSE implementation
+fuser = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/WebDAV client
+reqwest = { version = "0.12", features = ["json"] }
+http = "1.0"
+url = "2.5"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Secret storage (GNOME Keyring / Secret Service)
+secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Time
+chrono = "0.4"
+
+# Filesystem utils
+libc = "0.2"
+
+# Password input
+rpassword = "7.3"
