@@ -102,102 +102,123 @@ Patterns are semicolon-separated: `*.tmp;Trash/**;.git/**`
 
 ## Configuration Loader Implementation
 
-### Rules Dataclass
+### Rules Struct
 
-```python
-# davfs_sync/config.py
+```rust
+// src/config/mod.rs
 
-import os
-from pathlib import Path
-from dataclasses import dataclass, field
-from .systemd.credentials import CredentialManager
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-@dataclass
-class Rules:
-    pin: list[str] = field(default_factory=list)
-    ignore: list[str] = field(default_factory=list)
-    no_cache: list[str] = field(default_factory=list)
-    max_size_mb: int = 100
-    
-    @classmethod
-    def from_env(cls) -> "Rules":
-        def parse(key: str) -> list[str]:
-            val = os.environ.get(key, "")
-            return [p.strip() for p in val.split(";") if p.strip()]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rules {
+    pub pin: Vec<String>,
+    pub ignore: Vec<String>,
+    pub no_cache: Vec<String>,
+    pub max_size_mb: u64,
+}
+
+impl Rules {
+    pub fn from_env() -> Self {
+        fn parse_semicolon(key: &str) -> Vec<String> {
+            std::env::var(key)
+                .unwrap_or_default()
+                .split(';')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .collect()
+        }
         
-        return cls(
-            pin=parse("DAVFS_RULE_PIN"),
-            ignore=parse("DAVFS_RULE_IGNORE"),
-            no_cache=parse("DAVFS_RULE_NO_CACHE"),
-            max_size_mb=int(os.environ.get("DAVFS_RULE_MAX_SIZE_MB", "100")),
-        )
+        Self {
+            pin: parse_semicolon("DAVFS_RULE_PIN"),
+            ignore: parse_semicolon("DAVFS_RULE_IGNORE"),
+            no_cache: parse_semicolon("DAVFS_RULE_NO_CACHE"),
+            max_size_mb: std::env::var("DAVFS_RULE_MAX_SIZE_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100),
+        }
+    }
+}
 ```
 
-### Config Dataclass
+### Config Struct
 
-```python
-@dataclass
-class Config:
-    name: str
-    url: str
-    username: str
-    password: str
-    mount_point: Path
-    cache_dir: Path
-    data_dir: Path
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub mount_point: PathBuf,
+    pub cache_dir: PathBuf,
+    pub data_dir: PathBuf,
     
-    cache_max_gb: float
-    cache_evict_days: int
-    cache_min_free_gb: float
+    pub cache_max_gb: f64,
+    pub cache_evict_days: i32,
+    pub cache_min_free_gb: f64,
     
-    on_open_uncached: str
-    metadata_refresh_min: int
+    pub on_open_uncached: String,
+    pub metadata_refresh_min: i32,
     
-    max_concurrent: int
-    timeout_sec: int
-    retry_count: int
+    pub max_concurrent: usize,
+    pub timeout_sec: u64,
+    pub retry_count: u32,
     
-    log_level: str
-    rules: Rules
-    
-    @classmethod
-    def from_env(cls) -> "Config":
-        name = os.environ["DAVFS_NAME"]
-        home = Path.home()
+    pub log_level: String,
+    pub rules: Rules,
+}
+
+impl Config {
+    pub fn from_env() -> anyhow::Result<Self> {
+        use crate::secrets::{systemd_creds, secret_service};
         
-        # Load password from systemd credential or fallback
-        try:
-            password = CredentialManager().read_runtime()
-        except RuntimeError:
-            password = os.environ.get("DAVFS_PASSWORD", "")
-            if not password:
-                raise ValueError("No password available")
+        let name = std::env::var("DAVFS_NAME")?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!(\"No home dir\"))?;
         
-        return cls(
-            name=name,
-            url=os.environ["DAVFS_URL"],
-            username=os.environ["DAVFS_USERNAME"],
-            password=password,
-            mount_point=Path(os.environ["DAVFS_MOUNT_POINT"]).expanduser(),
-            cache_dir=Path(os.environ.get(
-                "DAVFS_CACHE_DIR", home / ".cache/davfs-sync" / name
-            )),
-            data_dir=Path(os.environ.get(
-                "DAVFS_DATA_DIR", home / ".local/share/davfs-sync" / name
-            )),
-            cache_max_gb=float(os.environ.get("DAVFS_CACHE_MAX_GB", "10")),
-            cache_evict_days=int(os.environ.get("DAVFS_CACHE_EVICT_DAYS", "30")),
-            cache_min_free_gb=float(os.environ.get("DAVFS_CACHE_MIN_FREE_GB", "5")),
-            on_open_uncached=os.environ.get("DAVFS_ON_OPEN_UNCACHED", "error"),
-            metadata_refresh_min=int(os.environ.get("DAVFS_METADATA_REFRESH_MIN", "15")),
-            max_concurrent=int(os.environ.get("DAVFS_MAX_CONCURRENT", "3")),
-            timeout_sec=int(os.environ.get("DAVFS_TIMEOUT_SEC", "30")),
-            retry_count=int(os.environ.get("DAVFS_RETRY_COUNT", "3")),
-            log_level=os.environ.get("DAVFS_LOG_LEVEL", "INFO"),
-            rules=Rules.from_env(),
-        )
+        // Load password: try systemd credential, then Secret Service, then env
+        let password = systemd_creds::read_password()
+            .or_else(|_| secret_service::get_password(&name))
+            .or_else(|_| std::env::var("DAVFS_PASSWORD")
+                .map_err(|_| anyhow::anyhow!(\"No password available\")))?;
+        
+        Ok(Self {
+            name: name.clone(),
+            url: std::env::var("DAVFS_URL")?,
+            username: std::env::var("DAVFS_USERNAME")?,
+            password,
+            mount_point: PathBuf::from(std::env::var("DAVFS_MOUNT_POINT")?),
+            cache_dir: std::env::var("DAVFS_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| home.join(\".cache/davfs-sync\").join(&name)),
+            data_dir: std::env::var("DAVFS_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| home.join(\".local/share/davfs-sync\").join(&name)),
+            cache_max_gb: std::env::var(\"DAVFS_CACHE_MAX_GB\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(10.0),
+            cache_evict_days: std::env::var(\"DAVFS_CACHE_EVICT_DAYS\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(30),
+            cache_min_free_gb: std::env::var(\"DAVFS_CACHE_MIN_FREE_GB\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(5.0),
+            on_open_uncached: std::env::var(\"DAVFS_ON_OPEN_UNCACHED\")
+                .unwrap_or_else(|_| \"error\".to_string()),
+            metadata_refresh_min: std::env::var(\"DAVFS_METADATA_REFRESH_MIN\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(15),
+            max_concurrent: std::env::var(\"DAVFS_MAX_CONCURRENT\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+            timeout_sec: std::env::var(\"DAVFS_TIMEOUT_SEC\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(30),
+            retry_count: std::env::var(\"DAVFS_RETRY_COUNT\")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(3),
+            log_level: std::env::var(\"DAVFS_LOG_LEVEL\")
+                .unwrap_or_else(|_| \"INFO\".to_string()),
+            rules: Rules::from_env(),
+        })
+    }
     
-    @property
-    def metadata_db(self) -> Path:
-        return self.data_dir / "metadata.db"
+    pub fn metadata_db(&self) -> PathBuf {
+        self.data_dir.join(\"metadata.db\")
+    }
+}
 ```

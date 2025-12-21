@@ -54,20 +54,50 @@
 ## Dependencies
 
 ```toml
-[project]
+[package]
 name = "davfs-sync"
 version = "0.1.0"
-requires-python = ">=3.10"
-dependencies = [
-    "fusepy>=3.0.1",
-    "webdav4>=0.10.0",
-    "httpx>=0.27.0",
-    "click>=8.0",
-    "rich>=13.0",
-]
+edition = "2021"
 
-[project.scripts]
-davfs-sync = "davfs_sync.cli:main"
+[dependencies]
+# FUSE implementation
+fuser = "0.14"
+
+# WebDAV client
+reqwest = { version = "0.11", features = ["json"] }
+http = "1.0"
+url = "2.5"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Systemd integration
+libsystemd = "0.7"
+sd-notify = "0.4"
+
+# Secret storage (GNOME Keyring / Secret Service)
+secret-service = "3.0"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Glob patterns
+globset = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
 ```
 
 ---
