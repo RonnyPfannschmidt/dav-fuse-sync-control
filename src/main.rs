@@ -6,6 +6,7 @@ mod config;
 mod filesystem;
 mod secrets;
 mod webdav;
+mod cache;
 
 use config::MountConfig;
 use filesystem::DavFS;
@@ -152,30 +153,60 @@ async fn mount_filesystem(name: String) -> Result<()> {
     println!("Connecting to: {}", config.url);
     println!("Mount point: {}", config.mount_point.display());
 
-    // Create mount point if it doesn't exist
-    std::fs::create_dir_all(&config.mount_point)?;
-
     // Check if mount point is already mounted and try to unmount it
     println!("Checking for existing mounts...");
-    let unmount_result = std::process::Command::new("fusermount3")
-        .arg("-u")
-        .arg(&config.mount_point)
-        .output();
     
-    match unmount_result {
-        Ok(output) if output.status.success() => {
-            println!("✓ Cleaned up existing mount");
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("not mounted") && !stderr.contains("Invalid argument") {
-                eprintln!("Warning: Unmount attempt: {}", stderr.trim());
+    // First, check if it's mounted using mountpoint command
+    let check_mounted = std::process::Command::new("mountpoint")
+        .arg("-q")
+        .arg(&config.mount_point)
+        .status();
+    
+    let is_mounted = check_mounted.map(|s| s.success()).unwrap_or(false);
+    
+    if is_mounted {
+        println!("Found existing mount, attempting to unmount...");
+        let unmount_result = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&config.mount_point)
+            .status();
+        
+        match unmount_result {
+            Ok(status) if status.success() => {
+                println!("✓ Successfully unmounted existing mount");
+                // Give it a moment to fully unmount
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Ok(_) => {
+                // Try lazy unmount as fallback
+                println!("Regular unmount failed, trying lazy unmount...");
+                let lazy_result = std::process::Command::new("fusermount3")
+                    .arg("-uz")
+                    .arg(&config.mount_point)
+                    .status();
+                
+                if lazy_result.map(|s| s.success()).unwrap_or(false) {
+                    println!("✓ Lazy unmount succeeded");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                } else {
+                    anyhow::bail!("Failed to unmount existing mount at {}. Please run: fusermount3 -uz {}", 
+                        config.mount_point.display(), config.mount_point.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not unmount: {}", e);
             }
         }
-        Err(e) => {
-            eprintln!("Warning: Could not check for existing mount: {}", e);
-        }
+    } else {
+        // Even if not mounted, might be a stale directory - try unmounting anyway
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-uz")
+            .arg(&config.mount_point)
+            .output();
     }
+
+    // Create mount point if it doesn't exist
+    std::fs::create_dir_all(&config.mount_point)?;
 
     // Create WebDAV client
     let webdav = webdav::WebDavClient::new(

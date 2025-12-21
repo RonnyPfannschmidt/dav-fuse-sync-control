@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::webdav::WebDavClient;
+use crate::cache::DirectoryCache;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -21,6 +22,8 @@ pub struct DavFS {
     // Map path to inode
     path_to_inode: Arc<Mutex<HashMap<String, u64>>>,
     next_inode: Arc<Mutex<u64>>,
+    // Directory listing cache
+    dir_cache: DirectoryCache,
 }
 
 impl DavFS {
@@ -31,7 +34,9 @@ impl DavFS {
         
         // Root directory is at /
         inode_to_path.insert(ROOT_INO, String::from("/"));
-        path_to_inode.insert(String::from("/"), ROOT_INO);
+        
+        // Create cache with 5 second TTL
+        let dir_cache = DirectoryCache::new(std::time::Duration::from_secs(5));
         
         Self {
             webdav,
@@ -39,6 +44,7 @@ impl DavFS {
             inode_to_path: Arc::new(Mutex::new(inode_to_path)),
             path_to_inode: Arc::new(Mutex::new(path_to_inode)),
             next_inode: Arc::new(Mutex::new(2)),
+            dir_cache,
         }
     }
     
@@ -158,26 +164,36 @@ impl Filesystem for DavFS {
         
         // Try to list parent directory to find this entry
         let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
-        match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
-            Ok(entries) => {
-                for entry in entries {
-                    if entry.name == name_str {
-                        let ino = self.get_or_create_inode(&full_path);
-                        let attr = if entry.is_dir {
-                            Self::dir_attr(ino)
-                        } else {
-                            Self::file_attr(ino, entry.size)
-                        };
-                        reply.entry(&TTL, &attr, 0);
-                        return;
-                    }
+        
+        // Try cache first, then fetch from server
+        let entries = if let Some(cached) = self.dir_cache.get(&parent_path) {
+            cached
+        } else {
+            match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
+                Ok(entries) => {
+                    self.dir_cache.insert(parent_path.clone(), entries.clone());
+                    entries
                 }
-                reply.error(ENOENT);
+                Err(_) => {
+                    reply.error(ENOENT);
+                    return;
+                }
             }
-            Err(_) => {
-                reply.error(ENOENT);
+        };
+        
+        for entry in entries {
+            if entry.name == name_str {
+                let ino = self.get_or_create_inode(&full_path);
+                let attr = if entry.is_dir {
+                    Self::dir_attr(ino)
+                } else {
+                    Self::file_attr(ino, entry.size)
+                };
+                reply.entry(&TTL, &attr, 0);
+                return;
             }
         }
+        reply.error(ENOENT);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
@@ -211,27 +227,37 @@ impl Filesystem for DavFS {
         
         // List parent to find this entry
         let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
-        match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
-            Ok(entries) => {
-                for entry in entries {
-                    if entry.name == name {
-                        let attr = if entry.is_dir {
-                            Self::dir_attr(ino)
-                        } else {
-                            Self::file_attr(ino, entry.size)
-                        };
-                        reply.attr(&TTL, &attr);
-                        return;
-                    }
+        
+        // Try cache first, then fetch from server
+        let entries = if let Some(cached) = self.dir_cache.get(parent_path) {
+            cached
+        } else {
+            match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
+                Ok(entries) => {
+                    self.dir_cache.insert(parent_path.to_string(), entries.clone());
+                    entries
                 }
-                reply.error(ENOENT);
+                Err(_) => {
+                    // Fallback to generic file attributes
+                    let attr = Self::file_attr(ino, 1024);
+                    reply.attr(&TTL, &attr);
+                    return;
+                }
             }
-            Err(_) => {
-                // Fallback to generic file attributes
-                let attr = Self::file_attr(ino, 1024);
+        };
+        
+        for entry in entries {
+            if entry.name == name {
+                let attr = if entry.is_dir {
+                    Self::dir_attr(ino)
+                } else {
+                    Self::file_attr(ino, entry.size)
+                };
                 reply.attr(&TTL, &attr);
+                return;
             }
         }
+        reply.error(ENOENT);
     }
 
     fn readdir(
@@ -264,44 +290,53 @@ impl Filesystem for DavFS {
             &dir_path[1..]
         };
         
-        // Try to list from WebDAV
-        match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
-            Ok(dav_entries) => {
-                tracing::info!("Listed {} entries from WebDAV at path {}", dav_entries.len(), dav_path);
-                
-                let mut all_entries = entries;
-                
-                for entry in dav_entries.iter() {
-                    let full_path = if dir_path == "/" {
-                        format!("/{}", entry.name)
-                    } else {
-                        format!("{}/{}", dir_path, entry.name)
-                    };
-                    
-                    let ino = self.get_or_create_inode(&full_path);
-                    let kind = if entry.is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    all_entries.push((ino, kind, entry.name.as_str()));
+        // Try cache first, then fetch from server
+        let dav_entries = if let Some(cached) = self.dir_cache.get(&dir_path) {
+            tracing::debug!("Using cached entries for path {}", dir_path);
+            cached
+        } else {
+            match self.runtime.block_on(self.webdav.list_dir(dav_path)) {
+                Ok(entries) => {
+                    tracing::info!("Listed {} entries from WebDAV at path {}", entries.len(), dav_path);
+                    self.dir_cache.insert(dir_path.clone(), entries.clone());
+                    entries
                 }
-
-                for (i, entry) in all_entries.iter().enumerate().skip(offset as usize) {
-                    if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
-                        break;
+                Err(e) => {
+                    tracing::error!("Failed to list directory: {}", e);
+                    
+                    // Still return . and ..
+                    for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+                        if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                            break;
+                        }
                     }
+                    reply.ok();
+                    return;
                 }
             }
-            Err(e) => {
-                tracing::error!("Failed to list directory: {}", e);
-                
-                // Still return . and ..
-                for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-                    if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
-                        break;
-                    }
-                }
+        };
+        
+        let mut all_entries = entries;
+        
+        for entry in dav_entries.iter() {
+            let full_path = if dir_path == "/" {
+                format!("/{}", entry.name)
+            } else {
+                format!("{}/{}", dir_path, entry.name)
+            };
+            
+            let ino = self.get_or_create_inode(&full_path);
+            let kind = if entry.is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            all_entries.push((ino, kind, entry.name.as_str()));
+        }
+
+        for (i, entry) in all_entries.iter().enumerate().skip(offset as usize) {
+            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                break;
             }
         }
 

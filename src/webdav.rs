@@ -101,6 +101,7 @@ impl WebDavClient {
         for response in responses.iter().skip(1) { // Skip first empty part
             let mut name = String::new();
             let mut is_dir = false;
+            let mut size: u64 = 0;
             
             // Extract displayname or href
             for line in response.lines() {
@@ -123,6 +124,13 @@ impl WebDavClient {
                 if line.contains("<d:collection") || line.contains("<d:collection/>") {
                     is_dir = true;
                 }
+                
+                // Extract file size
+                if line.contains("<d:getcontentlength>") {
+                    if let Some(size_str) = extract_tag_content(line, "d:getcontentlength") {
+                        size = size_str.parse().unwrap_or(0);
+                    }
+                }
             }
             
             // Add entry if we have a name and it's not the parent directory
@@ -130,7 +138,7 @@ impl WebDavClient {
                 entries.push(DavEntry {
                     name,
                     is_dir,
-                    size: 0,
+                    size,
                     modified: None,
                 });
             }
