@@ -227,6 +227,10 @@ async fn mount_filesystem(name: String) -> Result<()> {
 
     // Create filesystem
     let fs = DavFS::new(webdav);
+    
+    // Start aggressive background prefetching
+    println!("Starting background prefetch...");
+    fs.prefetch_initial();
 
     println!("\nMounting filesystem at {}...", config.mount_point.display());
     println!("Press Ctrl+C to unmount\n");

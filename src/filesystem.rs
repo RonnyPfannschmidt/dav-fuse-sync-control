@@ -31,7 +31,7 @@ impl DavFS {
     pub fn new(webdav: WebDavClient) -> Self {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut inode_to_path = HashMap::new();
-        let mut path_to_inode = HashMap::new();
+        let path_to_inode = HashMap::new();
         
         // Root directory is at /
         inode_to_path.insert(ROOT_INO, String::from("/"));
@@ -47,6 +47,158 @@ impl DavFS {
             next_inode: Arc::new(Mutex::new(2)),
             dir_cache,
         }
+    }
+    
+    pub fn prefetch_initial(&self) {
+        // Aggressive initial prefetch: root + 2 levels deep
+        let webdav = self.webdav.clone();
+        let cache = self.dir_cache.clone();
+        
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            
+            // Fetch root
+            match rt.block_on(webdav.list_dir("")) {
+                Ok(root_entries) => {
+                    tracing::info!("Prefetched root with {} entries", root_entries.len());
+                    
+                    let subdirs: Vec<_> = root_entries.iter()
+                        .filter(|e| e.is_dir)
+                        .map(|e| e.name.clone())
+                        .collect();
+                    
+                    cache.insert("/".to_string(), root_entries);
+                    
+                    // Prefetch all first-level directories
+                    for subdir in &subdirs {
+                        let path = format!("/{}", subdir);
+                        match rt.block_on(webdav.list_dir(subdir)) {
+                            Ok(entries) => {
+                                tracing::info!("Prefetched: {} ({} entries)", path, entries.len());
+                                
+                                // Prefetch second level too
+                                let subdirs2: Vec<_> = entries.iter()
+                                    .filter(|e| e.is_dir)
+                                    .map(|e| format!("{}/{}", subdir, e.name))
+                                    .take(5) // Limit per directory to avoid overwhelming
+                                    .collect();
+                                
+                                cache.insert(path, entries);
+                                
+                                // Prefetch second level
+                                for subdir2 in subdirs2 {
+                                    let path2 = format!("/{}", subdir2);
+                                    match rt.block_on(webdav.list_dir(&subdir2)) {
+                                        Ok(entries2) => {
+                                            let count = entries2.len();
+                                            cache.insert(path2.clone(), entries2);
+                                            tracing::info!("Prefetched: {} ({} entries)", path2, count);
+                                        }
+                                        Err(_) => {}
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    tracing::info!("Initial prefetch complete: {} top-level directories", subdirs.len());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to prefetch: {}", e);
+                }
+            }
+        });
+    }
+    
+    fn prefetch_subdirectories(&self, dir_path: &str, entries: &[crate::webdav::DavEntry]) {
+        // Background prefetch of subdirectories for faster navigation
+        // Go 3 levels deep for rapid prefetching
+        let subdirs: Vec<_> = entries.iter()
+            .filter(|e| e.is_dir)
+            .map(|e| {
+                if dir_path == "/" {
+                    format!("/{}", e.name)
+                } else {
+                    format!("{}/{}", dir_path, e.name)
+                }
+            })
+            .collect();
+        
+        if subdirs.is_empty() {
+            return;
+        }
+        
+        let webdav = self.webdav.clone();
+        let cache = self.dir_cache.clone();
+        
+        // Spawn background task to prefetch recursively
+        std::thread::spawn(move || {
+            // Create a new runtime in the background thread
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            
+            fn prefetch_recursive(
+                rt: &tokio::runtime::Runtime,
+                webdav: &crate::webdav::WebDavClient,
+                cache: &crate::cache::DirectoryCache,
+                path: &str,
+                depth: u32,
+                max_depth: u32,
+            ) {
+                if depth >= max_depth {
+                    return;
+                }
+                
+                // Check if already cached
+                if cache.get_stale(path).is_some() {
+                    return;
+                }
+                
+                // Fetch directory listing
+                let dav_path = if path == "/" { "" } else { &path[1..] };
+                match rt.block_on(webdav.list_dir(dav_path)) {
+                    Ok(entries) => {
+                        let num_entries = entries.len();
+                        
+                        // Find subdirectories before we move entries
+                        let subdirs: Vec<_> = entries.iter()
+                            .filter(|e| e.is_dir)
+                            .map(|e| {
+                                if path == "/" {
+                                    format!("/{}", e.name)
+                                } else {
+                                    format!("{}/{}", path, e.name)
+                                }
+                            })
+                            .collect();
+                        
+                        // Cache this directory
+                        cache.insert(path.to_string(), entries);
+                        
+                        tracing::info!("Prefetched {} (depth {}, {} entries, {} subdirs)", 
+                                      path, depth, num_entries, subdirs.len());
+                        
+                        // Recursively prefetch subdirectories
+                        for subdir in subdirs {
+                            prefetch_recursive(rt, webdav, cache, &subdir, depth + 1, max_depth);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to prefetch {}: {}", path, e);
+                    }
+                }
+            }
+            
+            // Prefetch up to 4 levels deep for very aggressive caching
+            for subdir_path in subdirs {
+                prefetch_recursive(&rt, &webdav, &cache, &subdir_path, 1, 4);
+            }
+        });
     }
     
     fn get_or_create_inode(&self, path: &str) -> u64 {
@@ -300,6 +452,10 @@ impl Filesystem for DavFS {
                 Ok(entries) => {
                     tracing::info!("Listed {} entries from WebDAV at path {}", entries.len(), dav_path);
                     self.dir_cache.insert(dir_path.clone(), entries.clone());
+                    
+                    // Trigger background prefetch of subdirectories
+                    self.prefetch_subdirectories(&dir_path, &entries);
+                    
                     entries
                 }
                 Err(e) => {
