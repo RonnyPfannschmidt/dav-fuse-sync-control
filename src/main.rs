@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -225,8 +225,25 @@ async fn mount_filesystem(name: String) -> Result<()> {
         }
     }
 
-    // Create filesystem
-    let fs = DavFS::new(webdav);
+    // Get cache database path - use XDG data directory
+    let cache_dir = dirs::data_local_dir()
+        .context("Failed to get local data directory")?
+        .join("davfs-sync");
+    
+    // Ensure cache directory exists
+    std::fs::create_dir_all(&cache_dir)?;
+    
+    let cache_db_file = cache_dir.join(format!("{}.db", name));
+    let cache_db_path = format!("sqlite://{}", cache_db_file.display());
+    println!("Using cache database: {}", cache_db_path);
+
+    // Initialize cache (must happen in async context)
+    println!("Initializing cache...");
+    let cache = cache::DirectoryCache::new(&cache_db_path, std::time::Duration::from_secs(5)).await?;
+    println!("✓ Cache initialized");
+
+    // Create filesystem (pass pre-created cache to avoid runtime-in-async issues)
+    let fs = DavFS::new(webdav, cache);
     
     // Start aggressive background prefetching
     println!("Starting background prefetch...");

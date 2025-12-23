@@ -1,96 +1,276 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use anyhow::Result;
+use sqlx::{SqlitePool, Row, sqlite::SqliteConnectOptions};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
 use crate::webdav::DavEntry;
 
 #[derive(Clone)]
 pub struct DirectoryCache {
-    entries: Arc<Mutex<HashMap<String, CachedDirectory>>>,
+    pool: SqlitePool,
     ttl: Duration,
 }
 
-struct CachedDirectory {
-    entries: Vec<DavEntry>,
-    cached_at: Instant,
-}
-
 impl DirectoryCache {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
-            ttl,
-        }
+    pub async fn new(db_path: &str, ttl: Duration) -> Result<Self> {
+        // Create connection options that will create the database if it doesn't exist
+        let options = SqliteConnectOptions::from_str(db_path)?
+            .create_if_missing(true);
+        
+        let pool = SqlitePool::connect_with(options).await?;
+        
+        // Run migrations
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await?;
+        
+        Ok(Self { pool, ttl })
     }
 
-    pub fn get(&self, path: &str) -> Option<Vec<DavEntry>> {
-        let entries = self.entries.lock().unwrap();
+    pub async fn get(&self, path: &str) -> Option<Vec<DavEntry>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         
-        if let Some(cached) = entries.get(path) {
-            if cached.cached_at.elapsed() < self.ttl {
-                tracing::debug!("Cache hit for path: {}", path);
-                return Some(cached.entries.clone());
-            } else {
-                tracing::debug!("Cache expired for path: {}", path);
-            }
+        // Check if directory exists and is fresh
+        let dir_row = sqlx::query(
+            "SELECT cached_at FROM directories WHERE path = ?"
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+        
+        let cached_at: i64 = dir_row.get(0);
+        let age = Duration::from_secs((now - cached_at) as u64);
+        
+        if age < self.ttl {
+            // Fetch entries
+            let rows = sqlx::query(
+                "SELECT name, is_dir, size, modified FROM entries WHERE directory_path = ? ORDER BY name"
+            )
+            .bind(path)
+            .fetch_all(&self.pool)
+            .await
+            .ok()?;
+            
+            let entries: Vec<DavEntry> = rows.iter().map(|row| {
+                let modified_secs: Option<i64> = row.get(3);
+                DavEntry {
+                    name: row.get(0),
+                    is_dir: row.get(1),
+                    size: row.get::<i64, _>(2) as u64,
+                    modified: modified_secs.map(|secs| {
+                        chrono::DateTime::from_timestamp(secs, 0)
+                            .unwrap()
+                            .with_timezone(&chrono::Utc)
+                    }),
+                }
+            }).collect();
+            
+            tracing::debug!("Cache hit for path: {}", path);
+            return Some(entries);
         } else {
-            tracing::debug!("Cache miss for path: {}", path);
-        }
-        
-        None
-    }
-    
-    pub fn get_stale(&self, path: &str) -> Option<Vec<DavEntry>> {
-        // Return cached data even if stale - for fast responses
-        let entries = self.entries.lock().unwrap();
-        
-        if let Some(cached) = entries.get(path) {
-            let age = cached.cached_at.elapsed();
-            if age < self.ttl {
-                tracing::debug!("Cache hit (fresh) for path: {}", path);
-            } else {
-                tracing::debug!("Cache hit (stale, age={:?}) for path: {}", age, path);
-            }
-            return Some(cached.entries.clone());
+            tracing::debug!("Cache expired for path: {}", path);
         }
         
         tracing::debug!("Cache miss for path: {}", path);
         None
     }
-
-    pub fn insert(&self, path: String, entries: Vec<DavEntry>) {
-        let mut cache = self.entries.lock().unwrap();
-        cache.insert(path.clone(), CachedDirectory {
-            entries,
-            cached_at: Instant::now(),
-        });
-        tracing::debug!("Cached {} entries for path: {}", cache.get(&path).map(|c| c.entries.len()).unwrap_or(0), path);
-    }
-
-    pub fn invalidate(&self, path: &str) {
-        let mut cache = self.entries.lock().unwrap();
-        cache.remove(path);
-        tracing::debug!("Invalidated cache for path: {}", path);
-    }
-
-    pub fn clear(&self) {
-        let mut cache = self.entries.lock().unwrap();
-        cache.clear();
-        tracing::info!("Cleared all cache entries");
-    }
-
-    pub fn stats(&self) -> CacheStats {
-        let cache = self.entries.lock().unwrap();
-        let total_entries = cache.len();
-        let expired = cache.values()
-            .filter(|c| c.cached_at.elapsed() >= self.ttl)
-            .count();
+    
+    pub async fn get_stale(&self, path: &str) -> Option<Vec<DavEntry>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         
-        CacheStats {
-            total_directories: total_entries,
-            expired_directories: expired,
-            active_directories: total_entries - expired,
+        // Check if directory exists
+        let dir_row = sqlx::query(
+            "SELECT cached_at FROM directories WHERE path = ?"
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+        
+        let cached_at: i64 = dir_row.get(0);
+        let age = Duration::from_secs((now - cached_at) as u64);
+        
+        // Fetch entries
+        let rows = sqlx::query(
+            "SELECT name, is_dir, size, modified FROM entries WHERE directory_path = ? ORDER BY name"
+        )
+        .bind(path)
+        .fetch_all(&self.pool)
+        .await
+        .ok()?;
+        
+        let entries: Vec<DavEntry> = rows.iter().map(|row| {
+            let modified_secs: Option<i64> = row.get(3);
+            DavEntry {
+                name: row.get(0),
+                is_dir: row.get(1),
+                size: row.get::<i64, _>(2) as u64,
+                modified: modified_secs.map(|secs| {
+                    chrono::DateTime::from_timestamp(secs, 0)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                }),
+            }
+        }).collect();
+        
+        if age < self.ttl {
+            tracing::debug!("Cache hit (fresh) for path: {}", path);
+        } else {
+            tracing::debug!("Cache hit (stale, age={:?}) for path: {}", age, path);
         }
+        Some(entries)
+    }
+    
+    pub async fn get_with_etag(&self, path: &str) -> Option<(Vec<DavEntry>, Option<String>)> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        // Check if directory exists
+        let dir_row = sqlx::query(
+            "SELECT etag, cached_at FROM directories WHERE path = ?"
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+        
+        let etag: Option<String> = dir_row.get(0);
+        let cached_at: i64 = dir_row.get(1);
+        let age = Duration::from_secs((now - cached_at) as u64);
+        
+        // Fetch entries
+        let rows = sqlx::query(
+            "SELECT name, is_dir, size, modified FROM entries WHERE directory_path = ? ORDER BY name"
+        )
+        .bind(path)
+        .fetch_all(&self.pool)
+        .await
+        .ok()?;
+        
+        let entries: Vec<DavEntry> = rows.iter().map(|row| {
+            let modified_secs: Option<i64> = row.get(3);
+            DavEntry {
+                name: row.get(0),
+                is_dir: row.get(1),
+                size: row.get::<i64, _>(2) as u64,
+                modified: modified_secs.map(|secs| {
+                    chrono::DateTime::from_timestamp(secs, 0)
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                }),
+            }
+        }).collect();
+        
+        if age < self.ttl {
+            tracing::debug!("Cache hit (fresh) for path: {}", path);
+        } else {
+            tracing::debug!("Cache hit (stale, age={:?}) for path: {} with etag: {:?}", age, path, etag);
+        }
+        Some((entries, etag))
+    }
+
+    pub async fn insert(&self, path: String, entries: Vec<DavEntry>, etag: Option<String>) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        // Start a transaction
+        let mut tx = self.pool.begin().await?;
+        
+        // Insert or update directory
+        sqlx::query(
+            "INSERT OR REPLACE INTO directories (path, etag, cached_at) VALUES (?, ?, ?)"
+        )
+        .bind(&path)
+        .bind(&etag)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        
+        // Delete old entries for this directory
+        sqlx::query("DELETE FROM entries WHERE directory_path = ?")
+            .bind(&path)
+            .execute(&mut *tx)
+            .await?;
+        
+        // Insert new entries
+        for entry in &entries {
+            let modified_secs = entry.modified.map(|dt| dt.timestamp());
+            sqlx::query(
+                "INSERT INTO entries (directory_path, name, is_dir, size, modified) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(&path)
+            .bind(&entry.name)
+            .bind(entry.is_dir)
+            .bind(entry.size as i64)
+            .bind(modified_secs)
+            .execute(&mut *tx)
+            .await?;
+        }
+        
+        tx.commit().await?;
+        
+        tracing::debug!("Cached {} entries for path: {} with etag: {:?}", entries.len(), path, etag);
+        Ok(())
+    }
+
+    pub async fn invalidate(&self, path: &str) -> Result<()> {
+        // Cascade delete will remove entries automatically
+        sqlx::query("DELETE FROM directories WHERE path = ?")
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+        
+        tracing::debug!("Invalidated cache for path: {}", path);
+        Ok(())
+    }
+
+    pub async fn clear(&self) -> Result<()> {
+        sqlx::query("DELETE FROM directories")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM entries")
+            .execute(&self.pool)
+            .await?;
+        
+        tracing::info!("Cleared all cache entries");
+        Ok(())
+    }
+
+    pub async fn stats(&self) -> Result<CacheStats> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        let ttl_secs = self.ttl.as_secs() as i64;
+        
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM directories")
+            .fetch_one(&self.pool)
+            .await?;
+        
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM directories WHERE cached_at < ?"
+        )
+        .bind(now - ttl_secs)
+        .fetch_one(&self.pool)
+        .await?;
+        
+        Ok(CacheStats {
+            total_directories: total as usize,
+            expired_directories: expired as usize,
+            active_directories: (total - expired) as usize,
+        })
     }
 }
 
