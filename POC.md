@@ -147,15 +147,25 @@ aggregates, recursive variants) is still unimplemented.
 - Read-only. `write`, `create`, `mkdir`, `unlink`, `rename` and `setattr` reply
   `EROFS`. The WebDAV verbs behind them (MKCOL, PUT, DELETE, MOVE) are
   implemented and tested, but nothing calls them.
-- No background sync worker: revalidation happens on access, not on a timer.
-- The content cache is never evicted or size-bounded.
-- No systemd unit; the process must stay running.
 - Conditional writes cannot be relied on universally. rclone's WebDAV server
-  ignores `If-Match` entirely (verified); Nextcloud honours it. See
-  `Capabilities::enforces_preconditions`.
+  ignores `If-Match` entirely; Nextcloud honours it. Both branches are verified
+  against real servers. See `Capabilities::enforces_preconditions`.
+- No glob rules (pin/ignore/no-cache patterns) yet.
+- The `user.davfs.state` xattr has no `progress` or directory-aggregate values.
 - No Google Drive backend yet. The `RemoteStorage` seam is shaped for it --
   opaque node ids, duplicate names, unknown sizes, a cursor change feed -- but
   the client is not written, and it will need a per-user OAuth client ID.
+
+## Running as a service
+
+`davfs-sync daemon` is the systemd entry point; `davfs-sync mount <name>` is the
+same code path in the foreground. The mount comes up *before* the initial crawl,
+so `READY=1` fires as soon as the filesystem is usable and a large or
+unreachable server cannot cause a start timeout.
+
+The shipped unit deliberately omits three directives `spec/02` recommends,
+because each is silently catastrophic — see
+[docs/systemd-checklist.md](docs/systemd-checklist.md).
 
 ## Fixed since the proof of concept
 
@@ -179,6 +189,8 @@ Each of these was a real defect, and each now has a test:
 | XML entities passed through raw (`apostrophe&#39;s.txt`) | decoded |
 | `Url::join` dropped a base segment and mangled `#`/`?`/`%` in names | URLs built from path segments |
 | `statfs` was `ENOSYS`, breaking `df` and some file choosers | implemented |
+| `process::exit(0)` from a signal handler skipped every `Drop`, leaving SQLite mid-WAL | ordered shutdown: unmount, join, checkpoint |
+| The mount point was force-unmounted on every start, which under `Restart=` could tear down a *different* live mount | only with an explicit `mount --force` |
 
 ## Next steps
 

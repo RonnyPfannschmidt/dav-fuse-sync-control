@@ -4,9 +4,9 @@ WebDAV Virtual Filesystem with Offline Sync — a FUSE client for Linux that
 presents a WebDAV share as a local directory, with metadata cached in SQLite so
 directory navigation stays responsive.
 
-**Status: read-only, and working.** Browsing and reading file content both
-work, over a real kernel mount. Writing does not. The remaining design lives in
-[spec/](spec/).
+**Status: read-only, and working.** Browsing and reading file content both work
+over a real kernel mount, verified against Nextcloud and rclone. Writing does
+not. The remaining design lives in [spec/](spec/).
 
 ## What works today
 
@@ -32,13 +32,18 @@ work, over a real kernel mount. Writing does not. The remaining design lives in
 - Import of an existing Nextcloud Desktop account (`setup-from-nextcloud`)
 - Nautilus extension showing status emblems from the xattr
 
+- systemd integration: `davfs-sync@.service` with `Type=notify` readiness, a
+  watchdog, bounded restarts, and a drop-in generator
+- A background worker: revalidation of the stalest directories, LRU cache
+  eviction bounded by size and free disk, and online/offline tracking
+
 ## What does not work yet
 
 - Read-only: write, create, delete and rename reply `EROFS`. The WebDAV verbs
   behind them are implemented and tested but deliberately not wired up.
-- No systemd integration; `mount` runs in the foreground only
-- No background sync worker, cache eviction, glob rules or conflict handling
-- No Google Drive backend (the seam is ready; the client is not written)
+- No glob rules or conflict handling
+- No Google Drive backend (the seam is ready; the client is not written, and it
+  will need a per-user OAuth client ID — see [docs/](docs/))
 
 ## Quick start
 
@@ -63,19 +68,55 @@ Nextcloud import is in [POC.md](POC.md).
 | `setup <name> --url --username --mount-point` | Configure a mount, prompting for the password |
 | `setup-from-nextcloud <name> --mount-point [--remote-path]` | Configure from an installed Nextcloud Desktop account |
 | `list` | List configured mounts |
-| `mount <name>` | Mount in the foreground |
+| `mount <name> [--force]` | Mount in the foreground |
+| `daemon` | Mount under systemd; configuration from `$DAVFS_*` |
+| `start\|stop\|status <name>` | `systemctl --user` wrappers |
 
 ## Testing
 
 ```bash
-cargo test --features testing        # 154 tests
+cargo test --features testing        # 203 tests
 ```
 
-Four tiers, each catching what the others cannot: unit tests, golden fixtures of
-real server responses, the core exercised against an in-memory backend with no
-mount at all, and a real FUSE mount over a real `rclone serve webdav`. The last
-two need `rclone`; the FUSE tier also needs `/dev/fuse`, and both skip politely
-without them.
+Five tiers, each catching what the others cannot:
+
+| Tier | Needs | Catches |
+|---|---|---|
+| unit + golden fixtures | nothing | parsing, naming, config, exit codes, unit files |
+| `tests/vfs.rs` | nothing | caching, staleness, offline, single-flighting — no mount at all |
+| `tests/webdav_live.rs`, `remote_seam.rs` | `rclone` | the client and the seam against a real server |
+| `tests/e2e_fuse.rs` | `rclone`, `/dev/fuse` | the FUSE shims, through ordinary syscalls |
+| `tests/nextcloud_live.rs` | a Nextcloud | the server this targets: `d:` prefixes, deep base paths, collection etags, real conditional requests |
+
+Tiers that need a tool skip politely without it. `DAVFS_E2E_REQUIRE=1` and
+`DAVFS_NEXTCLOUD_REQUIRE=1` turn a skip into a failure, which is what CI sets.
+
+To run the Nextcloud tier locally:
+
+```bash
+podman run -d --name nc -p 18080:80 \
+  -e SQLITE_DATABASE=nextcloud \
+  -e NEXTCLOUD_ADMIN_USER=admin -e NEXTCLOUD_ADMIN_PASSWORD=adminpass123 \
+  -e NEXTCLOUD_TRUSTED_DOMAINS='localhost 127.0.0.1' \
+  docker.io/library/nextcloud:30-apache
+
+DAVFS_NEXTCLOUD_URL=http://127.0.0.1:18080 \
+  cargo test --features testing --test nextcloud_live -- --test-threads 1
+```
+
+## Running as a service
+
+```bash
+cp systemd/davfs-sync@.service systemd/davfs-sync.target ~/.config/systemd/user/
+systemctl --user daemon-reload
+davfs-sync setup mycloud --url ... --username ... --mount-point ~/Cloud
+systemctl --user enable --now davfs-sync@mycloud.service
+```
+
+`setup` writes the drop-in. Before relying on it, run
+[scripts/systemd-smoke.sh](scripts/systemd-smoke.sh) and the checklist in
+[docs/systemd-checklist.md](docs/systemd-checklist.md) — in particular the check
+that the mount is visible *outside* the service.
 
 ## Documentation
 
