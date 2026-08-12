@@ -1,5 +1,30 @@
 # davfs-sync: Command-Line Interface
 
+## Implemented today
+
+Everything below the next heading is the target CLI. The PoC currently ships
+four subcommands, and none of them touch systemd:
+
+```bash
+# Configure a mount (prompts for the password, stores it in the Secret Service)
+$ davfs-sync setup <name> --url <url> --username <user> --mount-point <path>
+
+# Configure from an installed Nextcloud Desktop account
+$ davfs-sync setup-from-nextcloud <name> --mount-point <path> [--remote-path /Photos]
+
+# List configured mounts (name, URL, username, mount point)
+$ davfs-sync list
+
+# Mount in the foreground; Ctrl+C unmounts
+$ davfs-sync mount <name>
+```
+
+There is no `show`, `edit`, `remove`, `set-password`, service control, rule
+management, or per-file operation yet. Logging verbosity is controlled with
+`RUST_LOG` (default `davfs_sync=info`).
+
+---
+
 ## Command Structure
 
 All operations use the `davfs-sync` command with subcommands:

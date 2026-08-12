@@ -4,7 +4,27 @@
 
 Extended attributes provide a programmatic interface to query file status and trigger actions.
 
-### Read-Only Status Attributes
+### Implemented today
+
+The PoC exposes exactly one attribute, listed by `listxattr` and readable via
+`getxattr`. `setxattr` is not implemented, so none of the action triggers below
+work yet.
+
+| Attribute | Values |
+|-----------|--------|
+| `user.davfs.state` | `cached` / `cloud` / `unknown` |
+
+The value is derived from cache freshness, not from any per-file sync state:
+
+- `cached` — the root inode, or a directory whose cached listing is within the
+  5 s TTL
+- `cloud` — any file whose parent directory is cached (metadata known, content
+  never downloaded), or a directory whose listing is stale
+- `unknown` — nothing cached for the path or its parent
+
+`user.davfs.status` and the rest of the tables below are the target design.
+
+### Read-Only Status Attributes (planned)
 
 | Attribute | Description |
 |-----------|-------------|
@@ -18,7 +38,7 @@ Extended attributes provide a programmatic interface to query file status and tr
 | `user.davfs.error` | Error message (when status=error) |
 | `user.davfs.rule_match` | Matched glob pattern |
 
-### Directory Aggregates (Read-Only)
+### Directory Aggregates (Read-Only, planned)
 
 | Attribute | Description |
 |-----------|-------------|
@@ -30,7 +50,7 @@ Extended attributes provide a programmatic interface to query file status and tr
 | `user.davfs.children_local` | Local children count |
 | `user.davfs.children_remote` | Remote children count |
 
-### Action Triggers (Write-Only)
+### Action Triggers (Write-Only, planned)
 
 Write any value to trigger. Reading returns `ENODATA`.
 
@@ -76,6 +96,11 @@ $ getfattr -d -m "user.davfs.*" ~/Cloud/file.pdf
 ## File Manager Plugins
 
 ### Nautilus Extension (Python)
+
+A working extension already lives in
+[../nautilus-extension/](../nautilus-extension/). It reads `user.davfs.state`
+and adds emblems via `Nautilus.InfoProvider`. The sketch below is the
+richer menu-driven version this should grow into once the action xattrs exist.
 
 ```python
 # ~/.local/share/nautilus-python/extensions/davfs-sync.py

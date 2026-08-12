@@ -44,4 +44,14 @@ Configuration lives in systemd unit drop-ins. Secrets use `systemd-creds`. The d
 
 ## Project Status
 
-This is a specification document for a project under development. See the implementation stages in [01-overview.md](01-overview.md) for current progress.
+These are design documents, not a description of the code. The repository
+currently holds a proof of concept that implements part of Stage 1 (read-only
+directory browsing with a SQLite metadata cache) plus a Nautilus extension.
+
+- For what is actually implemented, read [../POC.md](../POC.md).
+- For stage-by-stage progress, see [01-overview.md](01-overview.md).
+
+Two deliberate divergences so far: the PoC stores configuration and passwords in
+the Secret Service instead of systemd credentials, and it uses `sqlx` instead of
+`rusqlite`. The systemd-drop-in design in [02-architecture.md](02-architecture.md)
+and [03-configuration.md](03-configuration.md) is entirely unimplemented.

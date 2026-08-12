@@ -4,10 +4,18 @@ This directory contains a Nautilus (GNOME Files) extension that shows status emb
 
 ## Features
 
-- Shows web/cloud emblem on files and folders (indicating they're available online but not downloaded)
-- Adds context menu item "WebDAV Info" to show mount information
-- Automatically detects davfs-sync mount points
-- Displays accurate status: files are NOT downloaded locally (PoC read-only mount)
+- Reads the `user.davfs.state` extended attribute and maps it to an emblem:
+  - `cached` → `emblem-default` (checkmark), tooltip "WebDAV Directory (cached)"
+  - `cloud` → `emblem-web` (cloud icon), tooltip "Available Online"
+  - `unknown` → no emblem
+- Falls back to a directory/file guess if the xattr cannot be read
+- Adds context menu item "WebDAV Info" that shows the mount point in a notification
+- Detects mount points by scanning `/proc/mounts` for `davfs-sync` or `fuse`
+  entries, re-reading at most every 5 seconds
+
+Note the mount-point detection is broad: any FUSE mount matches, so the emblem
+logic also runs on unrelated FUSE filesystems (where the xattr read fails and the
+fallback applies).
 
 ## Installation
 
@@ -60,9 +68,11 @@ Once installed:
 
 2. Open the mount point in Nautilus (GNOME Files)
 
-3. Files and folders will show web/cloud emblems indicating they are:
-   - **Available online only** (not downloaded locally)
-   - **Read-only** (this is a PoC mount)
+3. Files and folders will show emblems indicating they are:
+   - **Available online only** (cloud emblem — metadata is cached, content is
+     never downloaded in the PoC)
+   - **Cached** (checkmark — the directory listing is fresh in the local cache;
+     this says nothing about file content)
 
 4. Right-click on any file in the mount to see "WebDAV Info" in the context menu
 
@@ -111,6 +121,7 @@ Once installed:
 
 ## Future Enhancements
 
+- [ ] Narrow mount detection to davfs-sync mounts instead of every FUSE mount
 - [ ] Add D-Bus interface to query real sync state from davfs-sync daemon
 - [ ] Show different emblems for different states (syncing, conflict, error)
 - [ ] Add progress indicator for syncing files
