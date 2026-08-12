@@ -1,0 +1,65 @@
+[Unit]
+# Template unit -- %i is the mount name.
+#
+# Per-mount settings live in a drop-in written by `davfs-sync setup <name>`:
+#   ~/.config/systemd/user/davfs-sync@%i.service.d/50-davfs-sync.conf
+Description=davfs-sync WebDAV mount: %i
+Documentation=https://github.com/RonnyPfannschmidt/dav-fuse-sync-control
+PartOf=davfs-sync.target
+
+# Deliberately NOT ordered after network-online.target.
+#
+# This filesystem is cache-backed and is expected to come up offline -- waiting
+# for the network defeats its purpose. In the *user* manager that target is
+# inert anyway: nothing activates it, because NetworkManager-wait-online is a
+# system service.
+
+# Do not restart-storm a mount whose server or credentials are broken.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+Environment=DAVFS_NAME=%i
+
+ExecStart=/usr/bin/davfs-sync daemon
+
+# Only reached if we died without unmounting (SIGKILL, OOM, panic=abort).
+ExecStopPost=-/usr/bin/fusermount3 -uz ${DAVFS_MOUNT_POINT}
+
+KillSignal=SIGTERM
+KillMode=mixed
+# The mount comes up fast; the crawl happens after READY=1.
+TimeoutStartSec=90
+TimeoutStopSec=45
+WatchdogSec=60
+
+Restart=on-failure
+RestartSec=10
+# 77 EX_NOPERM (credentials rejected), 78 EX_CONFIG (bad or missing config).
+# Retrying either is pointless, and against Nextcloud repeated failed
+# authentication trips its brute-force protection and locks the account.
+# Keep in sync with src/exit.rs, which has a test for exactly this string.
+RestartPreventExitStatus=77 78
+
+# --- Sandboxing: read this before adding anything here ----------------------
+#
+# fusermount3 is setuid-root. Under NoNewPrivileges=yes the kernel silently
+# ignores the setuid bit, so every mount fails with EPERM.
+NoNewPrivileges=no
+#
+# ProtectSystem=, ProtectHome=, PrivateTmp=, ReadWritePaths= and friends each
+# give this unit its own mount namespace. Even when the mount then succeeds it
+# exists ONLY inside that namespace -- invisible to your shell, your file
+# manager, and every other process. Do not add them.
+PrivateMounts=no
+# ---------------------------------------------------------------------------
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=davfs-sync@%i
+
+[Install]
+WantedBy=davfs-sync.target

@@ -21,7 +21,8 @@ use crate::store::meta::{single_display_name, CachedNode};
 use crate::store::{ContentCache, MetaStore};
 
 /// What `open()` does when a file's content is not cached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OnOpenUncached {
     /// Fail immediately without fetching. This is the PoC's behaviour with a
     /// config knob on it, and makes the filesystem unable to read anything.

@@ -36,7 +36,7 @@ jobs:
       # No fuse3 and no rclone here: these tiers deliberately need neither, so
       # a broken runner image cannot silently disable them.
       - name: Unit, parser and cache tests
-        run: cargo nextest run --locked --features testing --lib --bins --test propfind --test vfs
+        run: cargo nextest run --locked --features testing --lib --bins --test propfind --test vfs --test systemd_units
 
       - run: cargo test --locked --doc
 

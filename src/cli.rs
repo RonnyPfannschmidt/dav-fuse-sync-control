@@ -8,11 +8,11 @@ use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
 use crate::config::MountConfig;
-use crate::fuse::{DavFS, OwnerIds};
+use crate::creds::{CredentialSource, ProcessEnv};
+use crate::daemon;
+use crate::dropin;
 use crate::remote::{RemoteStorage, WebDavBackend};
 use crate::secrets;
-use crate::store::{ContentCache, MetaStore};
-use crate::vfs::{Vfs, VfsConfig};
 use crate::webdav;
 
 #[derive(Parser)]
@@ -43,11 +43,28 @@ pub enum Commands {
         mount_point: String,
     },
 
-    /// Mount filesystem (stays in foreground)
+    /// Mount in the foreground. Ctrl+C unmounts.
     Mount {
         /// Name of the mount to use
         name: String,
+        /// Force-unmount anything already at the mount point first.
+        ///
+        /// Never done automatically, and never in `daemon` mode: under
+        /// `Restart=` a restarting instance could otherwise tear down a
+        /// different live mount.
+        #[arg(long)]
+        force: bool,
     },
+
+    /// Mount under systemd. Configuration comes from $DAVFS_* only.
+    Daemon,
+
+    /// Start a mount's systemd unit.
+    Start { name: String },
+    /// Stop a mount's systemd unit.
+    Stop { name: String },
+    /// Show a mount's systemd unit status.
+    Status { name: String },
 
     /// List configured mounts
     List,
@@ -75,7 +92,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             username,
             mount_point,
         } => setup_mount(name, url, username, mount_point).await,
-        Commands::Mount { name } => mount_filesystem(name).await,
+        Commands::Mount { name, force } => mount_foreground(name, force).await,
+        Commands::Daemon => run_daemon().await,
+        Commands::Start { name } => systemctl(&["start", &unit(&name)]),
+        Commands::Stop { name } => systemctl(&["stop", &unit(&name)]),
+        Commands::Status { name } => systemctl(&["status", &unit(&name)]),
         Commands::List => list_mounts().await,
         Commands::SetupFromNextcloud {
             name,
@@ -105,169 +126,160 @@ async fn setup_mount(
     let password = read_password()?;
 
     // Create config
-    let config = MountConfig {
-        name: name.clone(),
-        url,
-        username,
-        mount_point: mount_point.into(),
-    };
+    let config = MountConfig::new(name.clone(), url, username, mount_point.into());
 
     // Store config and password in Secret Service
     let secret_store = secrets::SecretStore::new().await?;
     secret_store.store_mount_config(&name, &config).await?;
     secret_store.store_password(&name, &password).await?;
 
-    println!("\n✓ Mount '{}' configured successfully!", name);
-    println!("\nTo mount:");
-    println!("  davfs-sync mount {}", name);
+    finish_setup(&name, &config)
+}
 
+/// Write the systemd drop-in and tell the user what to do next.
+///
+/// The drop-in carries the same values the foreground path reads from the
+/// keyring, so `mount` and `daemon` see an identical configuration.
+fn finish_setup(name: &str, config: &MountConfig) -> Result<()> {
+    dropin::validate_name(name)?;
+    println!("\n\u{2713} Mount '{}' configured.", name);
+
+    match dropin::write(name, &config.to_env()) {
+        Ok(path) => {
+            println!("  systemd drop-in: {}", path.display());
+            // Without this systemd will not see the new drop-in.
+            let reloaded = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !reloaded {
+                println!("  (run `systemctl --user daemon-reload` by hand)");
+            }
+            println!("\nRun in the foreground:");
+            println!("  davfs-sync mount {name}");
+            println!("\nOr as a service (needs the unit files from systemd/ installed):");
+            println!("  systemctl --user enable --now davfs-sync@{name}.service");
+        }
+        Err(e) => {
+            // Not fatal: the foreground path needs no drop-in at all.
+            println!("  (could not write the systemd drop-in: {e})");
+            println!("\nTo mount:");
+            println!("  davfs-sync mount {name}");
+        }
+    }
     Ok(())
 }
 
-async fn mount_filesystem(name: String) -> Result<()> {
-    println!("Loading mount configuration for '{}'...", name);
+fn unit(name: &str) -> String {
+    format!("davfs-sync@{name}.service")
+}
 
-    // Load config from Secret Service
-    let secret_store = secrets::SecretStore::new().await?;
-    let config = secret_store.load_mount_config(&name).await?;
-    let password = secret_store.load_password(&name).await?;
-
-    println!("Connecting to: {}", config.url);
-    println!("Mount point: {}", config.mount_point.display());
-
-    // Check if mount point is already mounted and try to unmount it
-    println!("Checking for existing mounts...");
-
-    // First, check if it's mounted using mountpoint command
-    let check_mounted = std::process::Command::new("mountpoint")
-        .arg("-q")
-        .arg(&config.mount_point)
-        .status();
-
-    let is_mounted = check_mounted.map(|s| s.success()).unwrap_or(false);
-
-    if is_mounted {
-        println!("Found existing mount, attempting to unmount...");
-        let unmount_result = std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(&config.mount_point)
-            .status();
-
-        match unmount_result {
-            Ok(status) if status.success() => {
-                println!("✓ Successfully unmounted existing mount");
-                // Give it a moment to fully unmount
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            Ok(_) => {
-                // Try lazy unmount as fallback
-                println!("Regular unmount failed, trying lazy unmount...");
-                let lazy_result = std::process::Command::new("fusermount3")
-                    .arg("-uz")
-                    .arg(&config.mount_point)
-                    .status();
-
-                if lazy_result.map(|s| s.success()).unwrap_or(false) {
-                    println!("✓ Lazy unmount succeeded");
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                } else {
-                    anyhow::bail!(
-                        "Failed to unmount existing mount at {}. Please run: fusermount3 -uz {}",
-                        config.mount_point.display(),
-                        config.mount_point.display()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: Could not unmount: {}", e);
-            }
-        }
-    } else {
-        // Even if not mounted, might be a stale directory - try unmounting anyway
-        let _ = std::process::Command::new("fusermount3")
-            .arg("-uz")
-            .arg(&config.mount_point)
-            .output();
+/// Thin wrapper over `systemctl --user`.
+fn systemctl(args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .context("running systemctl")?;
+    if !status.success() {
+        anyhow::bail!("systemctl --user {} failed", args.join(" "));
     }
-
-    // Create mount point if it doesn't exist
-    std::fs::create_dir_all(&config.mount_point)?;
-
-    // Build the backend behind the seam.
-    let client = webdav::WebDavClient::new(config.url.clone(), config.username.clone(), password)?;
-    let remote: Arc<dyn RemoteStorage> = Arc::new(WebDavBackend::new(client));
-
-    println!("Testing connection...");
-    match remote.probe().await {
-        Ok(_) => println!("\u{2713} Connected successfully!"),
-        Err(e) => {
-            eprintln!("\u{2717} Connection failed: {}", e);
-            eprintln!("Mounting anyway; cached data will still be served.");
-        }
-    }
-
-    // Metadata cache and content cache.
-    let data_dir = dirs::data_local_dir()
-        .context("no XDG data directory")?
-        .join("davfs-sync")
-        .join(&name);
-    let cache_dir = dirs::cache_dir()
-        .context("no XDG cache directory")?
-        .join("davfs-sync")
-        .join(&name);
-    std::fs::create_dir_all(&data_dir)?;
-    std::fs::create_dir_all(&cache_dir)?;
-
-    let db_path = format!("sqlite://{}", data_dir.join("metadata.db").display());
-    println!("Metadata: {}", db_path);
-    println!("Content:  {}", cache_dir.display());
-
-    let vfs_config = VfsConfig::default();
-    let meta = MetaStore::new(&db_path, vfs_config.ttl).await?;
-    meta.ensure_root(&remote.root(), "webdav").await?;
-    let content = ContentCache::new(&cache_dir)?;
-
-    let vfs = Vfs::new(
-        remote,
-        meta.clone(),
-        content,
-        OwnerIds::current(),
-        vfs_config,
-    )
-    .await?;
-
-    println!("Starting initial sync...");
-    match vfs.initial_sync(3).await {
-        Ok(n) => println!("\u{2713} Cached {} directories", n),
-        Err(e) => eprintln!("\u{26a0} Initial sync failed: {}; serving from cache", e),
-    }
-
-    let fs = DavFS::new(tokio::runtime::Handle::current(), vfs);
-
-    println!("\nMounting at {}...", config.mount_point.display());
-    println!("Press Ctrl+C to unmount\n");
-
-    let mut options = fuser::Config::default();
-    options.mount_options = vec![
-        fuser::MountOption::FSName("davfs-sync".to_string()),
-        fuser::MountOption::Subtype("davfs".to_string()),
-        fuser::MountOption::RO,
-        fuser::MountOption::NoAtime,
-    ];
-    // Several event loops, each with its own fd. Combined with handlers that
-    // spawn rather than block, one slow request no longer stalls the mount.
-    options.n_threads = Some(4);
-    options.clone_fd = true;
-
-    let mount_point = config.mount_point.clone();
-    let mount_result =
-        tokio::task::spawn_blocking(move || fuser::mount(fs, &mount_point, &options)).await?;
-
-    meta.close().await;
-    mount_result?;
-
-    println!("\nFilesystem unmounted.");
     Ok(())
+}
+
+/// Build the backend for a configured mount.
+async fn backend_for(config: &MountConfig, password: String) -> Result<Arc<dyn RemoteStorage>> {
+    match &config.backend {
+        crate::config::Backend::WebDav => {
+            let client = webdav::WebDavClient::with_timeout(
+                config.url.clone(),
+                config.username.clone(),
+                password,
+                std::time::Duration::from_secs(config.timeout_sec),
+            )?;
+            Ok(Arc::new(WebDavBackend::new(client)))
+        }
+        crate::config::Backend::GoogleDrive { .. } => {
+            anyhow::bail!("the Google Drive backend is not implemented yet")
+        }
+    }
+}
+
+fn params_for(config: &MountConfig) -> Result<daemon::MountParams> {
+    Ok(daemon::MountParams {
+        name: config.name.clone(),
+        mount_point: config.mount_point.clone(),
+        data_dir: config.data_dir()?,
+        cache_dir: config.cache_dir()?,
+        backend_tag: config.backend.tag().to_string(),
+        vfs: config.vfs_config(),
+        sync: config.sync_config(),
+        allow_other: config.allow_other,
+        fuse_threads: config.fuse_threads,
+        initial_sync_depth: config.initial_sync_depth,
+    })
+}
+
+/// `davfs-sync mount <name>`: configuration from the keyring, overlaid with any
+/// `DAVFS_*` in the environment, so this and `daemon` agree.
+async fn mount_foreground(name: String, force: bool) -> Result<()> {
+    let store = secrets::SecretStore::new().await?;
+    let mut config = store.load_mount_config(&name).await?;
+    config.name = name.clone();
+    config.apply_env(&ProcessEnv);
+
+    if force {
+        force_unmount(&config.mount_point);
+    } else if daemon::is_fuse_mount(&config.mount_point) {
+        anyhow::bail!(
+            "{} is already mounted; unmount it or pass --force",
+            config.mount_point.display()
+        );
+    }
+
+    let password = store.load_password(&name).await?;
+    let remote = backend_for(&config, password).await?;
+
+    println!(
+        "Mounting {} at {}",
+        config.url,
+        config.mount_point.display()
+    );
+    println!("Press Ctrl+C to unmount\n");
+    daemon::run(remote, params_for(&config)?).await
+}
+
+/// `davfs-sync daemon`: the systemd entry point. Everything comes from the
+/// environment, and credentials are resolved through the same source chain the
+/// unit's drop-in selects.
+async fn run_daemon() -> Result<()> {
+    let config = MountConfig::from_env(&ProcessEnv)?;
+    let source = CredentialSource::detect(&ProcessEnv)?;
+    tracing::info!("credential source: {:?}", source);
+
+    let password = source.password(&config.name, &ProcessEnv).await?;
+    let remote = backend_for(&config, password).await?;
+    daemon::run(remote, params_for(&config)?).await
+}
+
+/// Only ever from `mount --force`, never from `daemon`.
+fn force_unmount(mount_point: &std::path::Path) {
+    if !daemon::is_fuse_mount(mount_point) {
+        return;
+    }
+    eprintln!("Unmounting existing mount at {}", mount_point.display());
+    for args in [["-u", ""], ["-uz", ""]] {
+        let mut cmd = std::process::Command::new("fusermount3");
+        cmd.arg(args[0]).arg(mount_point);
+        if cmd.status().map(|s| s.success()).unwrap_or(false) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if !daemon::is_fuse_mount(mount_point) {
+                return;
+            }
+        }
+    }
+    eprintln!("Warning: could not unmount {}", mount_point.display());
 }
 
 async fn setup_from_nextcloud(
@@ -430,22 +442,18 @@ async fn setup_from_nextcloud(
     };
 
     // Create config
-    let config = MountConfig {
-        name: name.clone(),
-        url: webdav_url,
-        username: username.clone(),
-        mount_point: mount_point.into(),
-    };
+    let config = MountConfig::new(
+        name.clone(),
+        webdav_url,
+        username.clone(),
+        mount_point.into(),
+    );
 
     // Store config and password
     secret_store.store_mount_config(&name, &config).await?;
     secret_store.store_password(&name, &password).await?;
 
-    println!("\n✓ Mount '{}' configured successfully!", name);
-    println!("\nTo mount:");
-    println!("  davfs-sync mount {}", name);
-
-    Ok(())
+    finish_setup(&name, &config)
 }
 
 async fn list_mounts() -> Result<()> {

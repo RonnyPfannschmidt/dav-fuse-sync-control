@@ -1,0 +1,9 @@
+[Unit]
+# Group target, so all configured mounts can be started and stopped together:
+#   systemctl --user start davfs-sync.target
+Description=davfs-sync mounts
+Documentation=https://github.com/RonnyPfannschmidt/dav-fuse-sync-control
+StopWhenUnneeded=no
+
+[Install]
+WantedBy=default.target
