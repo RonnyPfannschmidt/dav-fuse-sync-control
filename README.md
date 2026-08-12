@@ -42,8 +42,10 @@ not. The remaining design lives in [spec/](spec/).
 - Read-only: write, create, delete and rename reply `EROFS`. The WebDAV verbs
   behind them are implemented and tested but deliberately not wired up.
 - No glob rules or conflict handling
-- No Google Drive backend (the seam is ready; the client is not written, and it
-  will need a per-user OAuth client ID — see [docs/](docs/))
+- Google Drive: the **client is implemented** and covered by mock tests, but it
+  is not wired to a mount yet — the OAuth consent flow is still missing, and it
+  has never run against real Drive. See
+  [issue #1](https://github.com/RonnyPfannschmidt/dav-fuse-sync-control/issues/1).
 
 ## Quick start
 
@@ -86,6 +88,7 @@ Five tiers, each catching what the others cannot:
 | `tests/vfs.rs` | nothing | caching, staleness, offline, single-flighting — no mount at all |
 | `tests/webdav_live.rs`, `remote_seam.rs` | `rclone` | the client and the seam against a real server |
 | `tests/e2e_fuse.rs` | `rclone`, `/dev/fuse` | the FUSE shims, through ordinary syscalls |
+| `tests/gdrive_mock.rs` | nothing | the Drive client's HTTP and JSON mapping, OAuth refresh, 403-reason classification |
 | `tests/nextcloud_live.rs` | a Nextcloud | the server this targets: `d:` prefixes, deep base paths, collection etags, real conditional requests |
 
 Tiers that need a tool skip politely without it. `DAVFS_E2E_REQUIRE=1` and

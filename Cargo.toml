@@ -98,3 +98,4 @@ davfs-sync = { path = ".", features = ["testing"] }
 tempfile = "3"
 insta = { version = "1", features = ["yaml", "filters"] }
 serial_test = "3"
+wiremock = "0.6"

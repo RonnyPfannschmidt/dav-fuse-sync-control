@@ -1,0 +1,43 @@
+{
+  "changes": [
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "fileId": "1updatedID",
+      "removed": false,
+      "file": {
+        "id": "1updatedID",
+        "name": "updated.txt",
+        "mimeType": "text/plain",
+        "parents": ["root"],
+        "size": "512",
+        "modifiedTime": "2026-08-12T07:00:00.000Z",
+        "md5Checksum": "cccccccccccccccccccccccccccccccc",
+        "version": "9",
+        "trashed": false
+      }
+    },
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "fileId": "deletedFileId",
+      "removed": true
+    },
+    {
+      "kind": "drive#change",
+      "changeType": "file",
+      "fileId": "trashedFileId",
+      "removed": false,
+      "file": {
+        "id": "trashedFileId",
+        "name": "in-the-bin.txt",
+        "mimeType": "text/plain",
+        "parents": ["root"],
+        "size": "10",
+        "version": "4",
+        "trashed": true
+      }
+    }
+  ],
+  "newStartPageToken": "200"
+}

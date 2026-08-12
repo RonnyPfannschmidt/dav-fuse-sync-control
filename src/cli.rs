@@ -200,8 +200,20 @@ async fn backend_for(config: &MountConfig, password: String) -> Result<Arc<dyn R
             )?;
             Ok(Arc::new(WebDavBackend::new(client)))
         }
-        crate::config::Backend::GoogleDrive { .. } => {
-            anyhow::bail!("the Google Drive backend is not implemented yet")
+        crate::config::Backend::GoogleDrive {
+            root_folder_id,
+            export_formats,
+        } => {
+            // The client is implemented and covered by tests/gdrive_mock.rs,
+            // but there is no consent flow yet: obtaining the initial refresh
+            // token needs a browser loopback exchange. See issue #1 for why it
+            // has not been exercised against real Drive.
+            let _ = (root_folder_id, export_formats, password);
+            anyhow::bail!(
+                "Google Drive mounts are not wired up yet: the OAuth consent flow \
+                 (`davfs-sync setup-gdrive`) is still missing. The backend itself \
+                 is implemented -- see src/remote/gdrive/."
+            )
         }
     }
 }

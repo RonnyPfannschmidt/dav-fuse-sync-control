@@ -1,0 +1,49 @@
+{
+  "files": [
+    {
+      "id": "1photoID",
+      "name": "photo.jpg",
+      "mimeType": "image/jpeg",
+      "parents": ["root"],
+      "size": "1048576",
+      "modifiedTime": "2026-08-12T06:37:07.000Z",
+      "createdTime": "2026-08-01T10:00:00.000Z",
+      "md5Checksum": "d41d8cd98f00b204e9800998ecf8427e",
+      "version": "3",
+      "trashed": false,
+      "headRevisionId": "0Bxyz123"
+    },
+    {
+      "id": "1docsFolderID",
+      "name": "Documents",
+      "mimeType": "application/vnd.google-apps.folder",
+      "parents": ["root"],
+      "modifiedTime": "2026-08-10T09:15:00.000Z",
+      "version": "8",
+      "trashed": false
+    },
+    {
+      "id": "1docID",
+      "name": "Meeting Notes",
+      "mimeType": "application/vnd.google-apps.document",
+      "parents": ["root"],
+      "modifiedTime": "2026-08-11T14:22:31.000Z",
+      "version": "17",
+      "trashed": false
+    },
+    {
+      "id": "1shortcutID",
+      "name": "shortcut to photo",
+      "mimeType": "application/vnd.google-apps.shortcut",
+      "parents": ["root"],
+      "modifiedTime": "2026-08-11T15:00:00.000Z",
+      "version": "2",
+      "trashed": false,
+      "shortcutDetails": {
+        "targetId": "1photoID",
+        "targetMimeType": "image/jpeg"
+      }
+    }
+  ],
+  "incompleteSearch": false
+}

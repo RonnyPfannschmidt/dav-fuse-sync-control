@@ -20,6 +20,7 @@
 //! WebDAV pays nothing for any of these: it reports `path_addressed: true`,
 //! `unique_names: true`, `dir_validators: true`, and `ChangeFeed::PerDirectory`.
 
+pub mod gdrive;
 pub mod propfind;
 pub mod webdav;
 
@@ -33,6 +34,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::error::RemoteError;
 
+pub use gdrive::GDriveBackend;
 pub use webdav::WebDavBackend;
 
 /// An opaque handle for a remote node, stable for that node's lifetime.
