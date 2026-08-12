@@ -4,32 +4,41 @@ WebDAV Virtual Filesystem with Offline Sync — a FUSE client for Linux that
 presents a WebDAV share as a local directory, with metadata cached in SQLite so
 directory navigation stays responsive.
 
-**Status: proof of concept.** Directory browsing works; reading file *content*
-does not (see [POC.md](POC.md)). The full intended design lives in [spec/](spec/)
-and is largely unimplemented.
+**Status: read-only, and working.** Browsing and reading file content both
+work, over a real kernel mount. Writing does not. The remaining design lives in
+[spec/](spec/).
 
 ## What works today
 
-- WebDAV connection with HTTP Basic auth and `PROPFIND` directory listings
-- Recursive `PROPFIND` (`Depth: infinity`, capped at 3 path levels) on mount to
-  populate the cache before the filesystem is exposed
-- SQLite metadata cache (`directories` + `entries` tables, 5 s TTL) at
-  `~/.local/share/davfs-sync/<name>.db`
-- Stale-while-revalidate: FUSE calls answer from cache immediately and schedule a
-  deduplicated background refresh using conditional `If-None-Match` requests
-- Nested directory navigation (`lookup`, `getattr`, `readdir`), read-only mount
-- `user.davfs.state` extended attribute (`cached` / `cloud` / `unknown`)
+- WebDAV with HTTP Basic auth, namespace-aware `PROPFIND` parsing, and typed
+  errors (a rate-limit no longer reaches applications as "file not found")
+- **Reading file content**, cached on disk and keyed by (identity, version), so
+  a changed file can never serve stale bytes
+- Offline: anything already cached keeps working with the server unreachable;
+  anything not cached fails `ENETUNREACH`, never `ENOENT`
+- SQLite metadata cache with stable inodes across remounts, at
+  `~/.local/share/davfs-sync/<name>/metadata.db`; blobs under
+  `~/.cache/davfs-sync/<name>/`
+- Stale-while-revalidate with conditional requests, plus a bounded breadth-first
+  crawl at mount time
+- Concurrent FUSE operations: handlers spawn rather than block, so one slow
+  request no longer stalls the mount
+- `readdirplus` and `statfs`
+- Extended attributes: `state`, `status`, `pinned`, `remote_size`, `local_size`,
+  `etag`, plus the `do_pin` / `do_unpin` / `do_download` / `do_free` /
+  `do_refresh` actions
+- A backend seam (`RemoteStorage`) shaped so a Google Drive client can drop in
 - Credentials and mount config in the Secret Service (GNOME Keyring, KWallet)
 - Import of an existing Nextcloud Desktop account (`setup-from-nextcloud`)
 - Nautilus extension showing status emblems from the xattr
 
 ## What does not work yet
 
-- `read()` always fails with `ENETUNREACH` — no file content is ever downloaded
-- Read-only: no write, create, delete, or rename
-- No pinning, selective sync, glob rules, or conflict handling
+- Read-only: write, create, delete and rename reply `EROFS`. The WebDAV verbs
+  behind them are implemented and tested but deliberately not wired up.
 - No systemd integration; `mount` runs in the foreground only
-- WebDAV XML is parsed with string matching, not an XML parser
+- No background sync worker, cache eviction, glob rules or conflict handling
+- No Google Drive backend (the seam is ready; the client is not written)
 
 ## Quick start
 
@@ -55,6 +64,18 @@ Nextcloud import is in [POC.md](POC.md).
 | `setup-from-nextcloud <name> --mount-point [--remote-path]` | Configure from an installed Nextcloud Desktop account |
 | `list` | List configured mounts |
 | `mount <name>` | Mount in the foreground |
+
+## Testing
+
+```bash
+cargo test --features testing        # 154 tests
+```
+
+Four tiers, each catching what the others cannot: unit tests, golden fixtures of
+real server responses, the core exercised against an in-memory backend with no
+mount at all, and a real FUSE mount over a real `rclone serve webdav`. The last
+two need `rclone`; the FUSE tier also needs `/dev/fuse`, and both skip politely
+without them.
 
 ## Documentation
 

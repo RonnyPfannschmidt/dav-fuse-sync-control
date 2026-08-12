@@ -124,7 +124,7 @@ jobs:
         # sibling test.
         run: |
           if ls tests/e2e_*.rs >/dev/null 2>&1; then
-            cargo nextest run --locked --test-threads 1 -E 'binary(/^e2e_/)'
+            cargo nextest run --locked --features testing --test-threads 1 -E 'binary(/^e2e_/)'
           else
             echo "no e2e_* test binaries yet; skipping"
           fi

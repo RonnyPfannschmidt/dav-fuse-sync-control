@@ -6,31 +6,35 @@
 
 **Design Philosophy:** Configuration lives in systemd unit drop-ins. Secrets use `systemd-creds`. The daemon reads configuration from environment variables set by systemd.
 
-> **Implementation status.** This document describes the target design. The code
-> in this repository is a proof of concept that covers part of Stage 1 only; the
-> checkboxes below track that. It also diverges from the design in two ways: the
-> PoC stores configuration and passwords in the Secret Service rather than
-> systemd credentials, and it runs in the foreground rather than as a systemd
-> service. See [../POC.md](../POC.md) for what actually works.
+> **Implementation status.** This document describes the target design; the
+> checkboxes below track what exists. Stage 1 is complete and Stage 2 is mostly
+> complete. Two deliberate divergences remain: configuration and passwords live
+> in the Secret Service rather than systemd credentials, and the daemon runs in
+> the foreground. A third has been added since: everything now talks to a
+> `RemoteStorage` trait rather than to WebDAV directly, so a second backend can
+> be added without touching the layers above.
+>
+> See [../POC.md](../POC.md) for what actually works.
 
 ---
 
 ## Implementation Stages
 
 ### Stage 1: Core FUSE Mount (MVP)
-- [x] Basic FUSE operations (getattr, readdir, lookup, open)
-- [x] WebDAV client wrapper (reqwest + `PROPFIND`)
-- [x] SQLite metadata store (directory listings, ETags, TTL)
-- [ ] `read` — currently returns `ENETUNREACH` unconditionally
-- [ ] Simple file caching (download on open)
-- [ ] Environment-based configuration — PoC uses Secret Service instead
-- [ ] CLI: `davfs-sync daemon` (runs under systemd) — PoC has foreground `mount`
+- [x] Basic FUSE operations (getattr, readdir, readdirplus, lookup, open, statfs)
+- [x] WebDAV client wrapper (reqwest + namespace-aware `PROPFIND`)
+- [x] SQLite metadata store (id-keyed nodes, validators, TTL, stable inodes)
+- [x] `read` — content is downloaded and served from a blob cache
+- [x] File caching (download on open, keyed by identity + version)
+- [ ] Environment-based configuration — uses Secret Service instead
+- [ ] CLI: `davfs-sync daemon` (runs under systemd) — foreground `mount` only
 
 ### Stage 2: Sync State & Control
-- [ ] Sync state tracking (remote/local/syncing/error) — PoC only derives
-      `cached`/`cloud`/`unknown` from cache freshness
-- [ ] Read-only xattrs (status, progress, sizes) — PoC exposes `user.davfs.state` only
-- [ ] Action xattrs (do_pin, do_download, do_free)
+- [x] Sync state tracking (the `SyncState` column and vocabulary exist; only
+      `Clean` is reachable until writes land)
+- [x] Read-only xattrs (state, status, pinned, sizes, etag) — progress and
+      directory aggregates still missing
+- [x] Action xattrs (do_pin, do_unpin, do_download, do_free, do_refresh)
 - [ ] Background sync worker with queue
 - [ ] CLI: `davfs-sync status/pin/free/download`
 
@@ -88,13 +92,15 @@ dirs = "5.0"
 rpassword = "7.3"
 ```
 
+Since added: `quick-xml` (the PROPFIND parser), `async-trait` (the backend
+seam), `blake3` (content-cache keys), `bytes`/`futures`/`tokio-util` (streaming),
+`percent-encoding` (replacing `urlencoding`), and `rand` (retry jitter).
+
 Still to be added for the stages above:
 
 ```toml
-libsystemd = "0.7"    # Stage 3: systemd integration
-sd-notify = "0.4"     # Stage 3: watchdog / readiness
+sd-notify = "0.5"     # Stage 3: watchdog / readiness (pure Rust; no libsystemd)
 globset = "0.4"       # Stage 4: glob rules
-quick-xml = "0.36"    # replace the string-matching PROPFIND parser
 ```
 
 Note the design originally called for `rusqlite`; the implementation uses `sqlx`

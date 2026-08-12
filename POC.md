@@ -1,8 +1,8 @@
-# davfs-sync Proof of Concept
+# davfs-sync: current implementation
 
-The current implementation is a read-only WebDAV browser: it mirrors the remote
-directory tree into a FUSE mount, backed by a SQLite metadata cache. File
-*content* is never fetched.
+A read-only WebDAV filesystem: it mirrors the remote directory tree into a FUSE
+mount backed by a SQLite metadata cache, and downloads file content on demand
+into an on-disk blob cache.
 
 ## Features
 
@@ -71,64 +71,114 @@ See [SETUP.md](SETUP.md) for per-distribution package names.
    getfattr -n user.davfs.state ~/Cloud/Documents
    ```
 
-6. Try to read a file (this fails by design):
+6. Read a file:
    ```bash
    cat ~/Cloud/somefile.txt
-   # cat: /home/user/Cloud/somefile.txt: Network is unreachable
    ```
+   The first read downloads and caches the content; later reads are local, and
+   keep working with the server unreachable.
 
 ## How mounting works
 
-1. If the mount point is already mounted, `fusermount3 -u` (then `-uz`) is run to
-   clear it.
-2. The WebDAV connection is tested with a `Depth: 0` `PROPFIND`. A failure is
-   reported but does not abort the mount.
-3. The cache database is opened at
-   `~/.local/share/davfs-sync/<name>.db` and migrations are applied.
-4. `initial_sync()` issues one `Depth: infinity` `PROPFIND`, keeps entries up to
-   3 path levels deep, and writes every directory listing to the cache. A failure
-   here is reported and the mount continues with whatever is already cached.
-5. The FUSE filesystem is mounted read-only with `fuser::mount2`.
+1. Credentials and mount config are read from the Secret Service.
+2. A `WebDavClient` is wrapped in a `WebDavBackend` and used behind the
+   `RemoteStorage` trait; nothing above that layer knows it is WebDAV.
+3. The connection is probed. A failure is reported but does not abort the
+   mount -- cached data is still worth serving.
+4. Two caches are opened: metadata at
+   `~/.local/share/davfs-sync/<name>/metadata.db`, blobs under
+   `~/.cache/davfs-sync/<name>/`. Migrations are applied and the root node is
+   seeded. If the database belongs to a different account, it is wiped.
+5. `initial_sync()` walks the tree breadth-first with `Depth: 1` listings, two
+   levels deep, fetching each level concurrently.
+6. The filesystem is mounted read-only with several event loop threads, each
+   with its own fd.
 
 ## Cache behaviour
 
-The cache TTL is 5 seconds (hardcoded in `mount_filesystem`).
+The metadata TTL is 30 seconds. Directory listings are always served from cache
+when one exists, however old; if it is past its TTL a deduplicated background
+revalidation is scheduled behind the answer. Only a directory that has never
+been listed causes a blocking request. Revalidation is conditional, using the
+directory's `getetag` from the previous response, so an unchanged directory
+costs one 304.
 
-`lookup`, `getattr`, and `readdir` all follow the same path: read the cached
-listing regardless of age, then call `schedule_refresh()`. That helper skips the
-work if a refresh for the same path is already in flight or if the entry is still
-within its TTL; otherwise it spawns a task that revalidates with `If-None-Match`
-and rewrites the cache on a 200. Only a completely uncached directory causes a
-blocking WebDAV request.
+File content is downloaded whole on first `open()` and stored as a blob keyed by
+`blake3(node id + validator)`. Because the key includes the version, a changed
+file cannot hit an old blob. Downloads are single-flighted: many concurrent
+opens of one file produce one request. `open()` blocks until the content is
+ready by default (`error` and `background` policies also exist), so failures
+surface where applications expect them.
+
+Content is written to `partial/`, fsync'd, and only then renamed into `blobs/`
+and recorded in the database -- so the database can never point at a blob that
+is not fully there. Blob handles are opened once, at `open()`, which is what
+makes future eviction safe while readers are active.
 
 ## Extended attributes
 
-`user.davfs.state` is the only attribute implemented:
+Read-only:
 
-| Value | Meaning |
-|-------|---------|
-| `cached` | Directory with a listing inside its TTL (the root is always `cached`) |
-| `cloud` | Metadata known, content not local — every file, and directories with a stale listing |
-| `unknown` | Nothing cached for this path or its parent |
+| Attribute | Meaning |
+|---|---|
+| `user.davfs.state` | `cached` / `cloud` — for a file, whether content is local; for a directory, whether its listing is fresh |
+| `user.davfs.status` | `remote` / `local` / `modified` / `syncing` / `conflict` / `error` |
+| `user.davfs.pinned` | `1` or `0` |
+| `user.davfs.remote_size` | server size, or `unknown` for a node with no size until exported |
+| `user.davfs.local_size` | bytes cached locally |
+| `user.davfs.etag` | the current validator |
 
-The spec's much larger xattr surface (`user.davfs.status`, `do_pin`, progress,
-directory aggregates) is not implemented — see [spec/05-integration.md](spec/05-integration.md).
+Write to trigger (`setfattr`):
+
+| Attribute | Action |
+|---|---|
+| `user.davfs.do_download` | fetch content now |
+| `user.davfs.do_free` | drop cached content (refused if pinned) |
+| `user.davfs.do_pin` / `do_unpin` | keep content locally |
+| `user.davfs.do_refresh` | revalidate this directory now |
+
+`user.davfs.state` keeps its exact vocabulary because the Nautilus extension
+depends on it. The larger surface in
+[spec/05-integration.md](spec/05-integration.md) (progress, directory
+aggregates, recursive variants) is still unimplemented.
 
 ## Current limitations
 
-- `read()` unconditionally returns `ENETUNREACH`; no file content is downloaded
-  or cached
-- Read-only mount: no write, create, delete, rename, or `setxattr`
-- `mtime`/`atime`/`ctime` are reported as the Unix epoch even though `PROPFIND`
-  timestamps are parsed and stored
-- WebDAV XML is parsed by line-oriented string matching, and only handles the
-  `d:` namespace prefix
-- Initial sync depth is capped at 3 levels; deeper directories are fetched
-  on demand
-- Inode numbers are assigned in memory and never reused or reclaimed, so they
-  change across mounts
-- The cache database is never pruned or size-bounded
-- No systemd unit; the process must stay running
+- Read-only. `write`, `create`, `mkdir`, `unlink`, `rename` and `setattr` reply
+  `EROFS`. The WebDAV verbs behind them (MKCOL, PUT, DELETE, MOVE) are
+  implemented and tested, but nothing calls them.
+- No background sync worker: revalidation happens on access, not on a timer.
+- The content cache is never evicted or size-bounded.
+- No systemd unit; the process must stay running.
+- Conditional writes cannot be relied on universally. rclone's WebDAV server
+  ignores `If-Match` entirely (verified); Nextcloud honours it. See
+  `Capabilities::enforces_preconditions`.
+- No Google Drive backend yet. The `RemoteStorage` seam is shaped for it --
+  opaque node ids, duplicate names, unknown sizes, a cursor change feed -- but
+  the client is not written, and it will need a per-user OAuth client ID.
+
+## Fixed since the proof of concept
+
+Each of these was a real defect, and each now has a test:
+
+| Was | Now |
+|---|---|
+| `read()` always returned `ENETUNREACH` | content is downloaded and cached |
+| The parser returned **zero entries** against `rclone serve webdav` (it split on the literal `<d:response>`; rclone emits `<D:response>`, on one line) | namespace-aware parsing; prefix-independent |
+| Every directory listed itself as its own child | the `Depth: 1` self-entry is separated out |
+| Conditional requests never fired (a 207 carries no `ETag` header, so the validator was always `None`) | the validator comes from the self-entry's `<getetag>` in the body |
+| 304 was signalled by an empty `Vec`, so deleting the last file in a directory never propagated | an explicit `ListResult`/`Listing` variant |
+| `Depth: infinity`, which Nextcloud and SabreDAV reject with 403 | a bounded breadth-first crawl of `Depth: 1` listings |
+| mtimes were parsed, stored, then reported as the Unix epoch | real mtimes reach the kernel |
+| Directories could never report `cached` (the check was `path.ends_with('/')`, never true) | state is derived from the node's kind |
+| Every failure became `ENOENT`, so a rate-limit told applications the file was gone | typed errors with a tested errno mapping |
+| Inode numbers changed on every mount | persisted, stable across remounts |
+| Every FUSE operation was serialized on one thread | handlers spawn; several event loops |
+| `chrono::DateTime::from_timestamp(..).unwrap()` panicked the filesystem on a corrupt timestamp | degrades to `None` |
+| `INSERT OR REPLACE` cascaded a directory's children away | `ON CONFLICT DO UPDATE` |
+| XML entities passed through raw (`apostrophe&#39;s.txt`) | decoded |
+| `Url::join` dropped a base segment and mangled `#`/`?`/`%` in names | URLs built from path segments |
+| `statfs` was `ENOSYS`, breaking `df` and some file choosers | implemented |
 
 ## Next steps
 
