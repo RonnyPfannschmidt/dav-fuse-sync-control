@@ -32,6 +32,7 @@ async-trait = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 rand = "0.9"
+blake3 = "1"
 
 # HTTP/WebDAV client.
 # rustls rather than the default native-tls: it removes the only system library
@@ -92,3 +93,4 @@ testing = []
 davfs-sync = { path = ".", features = ["testing"] }
 tempfile = "3"
 insta = { version = "1", features = ["yaml", "filters"] }
+serial_test = "3"

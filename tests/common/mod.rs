@@ -5,5 +5,6 @@
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod guard;
 pub mod rclone;
 pub mod tree;

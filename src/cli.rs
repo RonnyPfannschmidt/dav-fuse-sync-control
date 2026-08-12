@@ -5,11 +5,14 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 use crate::config::MountConfig;
-use crate::filesystem::DavFS;
+use crate::fuse::{DavFS, OwnerIds};
+use crate::remote::{RemoteStorage, WebDavBackend};
 use crate::secrets;
-use crate::store::MetaStore;
+use crate::store::{ContentCache, MetaStore};
+use crate::vfs::{Vfs, VfsConfig};
 use crate::webdav;
 
 #[derive(Parser)]
@@ -121,77 +124,6 @@ async fn setup_mount(
     Ok(())
 }
 
-/// Populate the cache before the filesystem is exposed.
-///
-/// A breadth-first crawl of `Depth: 1` listings, not one `Depth: infinity`
-/// request. Nextcloud and SabreDAV reject `Depth: infinity` outright with
-/// `403 Propfind-Finite-Depth`, so the PoC's "one recursive PROPFIND" silently
-/// failed against the exact servers it was written for, and the mount fell back
-/// to fetching every directory synchronously on first access.
-///
-/// Each level is fetched concurrently, bounded by `max_concurrent`.
-async fn initial_sync(
-    webdav: &webdav::WebDavClient,
-    cache: &MetaStore,
-    max_depth: usize,
-    max_concurrent: usize,
-) -> Result<usize> {
-    use futures::stream::{self, StreamExt};
-
-    let mut frontier = vec![String::from("/")];
-    let mut cached = 0usize;
-
-    for depth in 0..max_depth {
-        if frontier.is_empty() {
-            break;
-        }
-        tracing::info!("initial sync: level {} ({} dirs)", depth, frontier.len());
-
-        let results: Vec<(String, Option<Vec<webdav::DavEntry>>, Option<String>)> =
-            stream::iter(frontier.iter().cloned())
-                .map(|path| async move {
-                    let dav_path = path.trim_start_matches('/');
-                    match webdav.list_dir(dav_path, None).await {
-                        Ok(webdav::ListResult::Modified { entries, etag }) => {
-                            (path, Some(entries), etag)
-                        }
-                        // No validator was sent, so this cannot happen; treat it
-                        // as "nothing to store" rather than asserting.
-                        Ok(webdav::ListResult::NotModified) => (path, None, None),
-                        Err(e) => {
-                            tracing::warn!("initial sync: {} failed: {}", path, e);
-                            (path, None, None)
-                        }
-                    }
-                })
-                .buffer_unordered(max_concurrent)
-                .collect()
-                .await;
-
-        let mut next = Vec::new();
-        for (path, entries, etag) in results {
-            let Some(entries) = entries else { continue };
-
-            for e in entries.iter().filter(|e| e.is_dir) {
-                next.push(if path == "/" {
-                    format!("/{}", e.name)
-                } else {
-                    format!("{}/{}", path, e.name)
-                });
-            }
-
-            // The validator is stored, so the first background revalidation of
-            // each directory is conditional. The PoC passed `None` here, which
-            // meant every directory was re-fetched in full at least once.
-            cache.insert(path, entries, etag).await?;
-            cached += 1;
-        }
-        frontier = next;
-    }
-
-    Ok(cached)
-}
-
 async fn mount_filesystem(name: String) -> Result<()> {
     println!("Loading mount configuration for '{}'...", name);
 
@@ -261,90 +193,77 @@ async fn mount_filesystem(name: String) -> Result<()> {
     // Create mount point if it doesn't exist
     std::fs::create_dir_all(&config.mount_point)?;
 
-    // Create WebDAV client
-    let webdav = webdav::WebDavClient::new(config.url.clone(), config.username.clone(), password)?;
+    // Build the backend behind the seam.
+    let client = webdav::WebDavClient::new(config.url.clone(), config.username.clone(), password)?;
+    let remote: Arc<dyn RemoteStorage> = Arc::new(WebDavBackend::new(client));
 
-    // Test connection
     println!("Testing connection...");
-    match webdav.test_connection().await {
-        Ok(_) => println!("✓ Connected successfully!"),
+    match remote.probe().await {
+        Ok(_) => println!("\u{2713} Connected successfully!"),
         Err(e) => {
-            eprintln!("✗ Connection failed: {}", e);
-            eprintln!("The filesystem will mount, but operations will fail until connection is available.");
+            eprintln!("\u{2717} Connection failed: {}", e);
+            eprintln!("Mounting anyway; cached data will still be served.");
         }
     }
 
-    // Get cache database path - use XDG data directory
-    let cache_dir = dirs::data_local_dir()
-        .context("Failed to get local data directory")?
-        .join("davfs-sync");
-
-    // Ensure cache directory exists
+    // Metadata cache and content cache.
+    let data_dir = dirs::data_local_dir()
+        .context("no XDG data directory")?
+        .join("davfs-sync")
+        .join(&name);
+    let cache_dir = dirs::cache_dir()
+        .context("no XDG cache directory")?
+        .join("davfs-sync")
+        .join(&name);
+    std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&cache_dir)?;
 
-    let cache_db_file = cache_dir.join(format!("{}.db", name));
-    let cache_db_path = format!("sqlite://{}", cache_db_file.display());
-    println!("Using cache database: {}", cache_db_path);
+    let db_path = format!("sqlite://{}", data_dir.join("metadata.db").display());
+    println!("Metadata: {}", db_path);
+    println!("Content:  {}", cache_dir.display());
 
-    // Initialize cache (must happen in async context)
-    println!("Initializing cache...");
-    let cache = MetaStore::new(&cache_db_path, std::time::Duration::from_secs(5)).await?;
-    println!("✓ Cache initialized");
+    let vfs_config = VfsConfig::default();
+    let meta = MetaStore::new(&db_path, vfs_config.ttl).await?;
+    meta.ensure_root(&remote.root(), "webdav").await?;
+    let content = ContentCache::new(&cache_dir)?;
 
-    // Perform initial sync before creating filesystem
+    let vfs = Vfs::new(
+        remote,
+        meta.clone(),
+        content,
+        OwnerIds::current(),
+        vfs_config,
+    )
+    .await?;
+
     println!("Starting initial sync...");
-    match initial_sync(&webdav, &cache, 3, 4).await {
-        Ok(dir_count) => {
-            println!("✓ Initial sync complete! Cached {} directories", dir_count);
-        }
-        Err(e) => {
-            eprintln!("⚠ Initial sync failed: {}", e);
-            eprintln!("Will mount with stale cache (if available)");
-        }
+    match vfs.initial_sync(3).await {
+        Ok(n) => println!("\u{2713} Cached {} directories", n),
+        Err(e) => eprintln!("\u{26a0} Initial sync failed: {}; serving from cache", e),
     }
 
-    // Create filesystem with populated cache
-    let fs = DavFS::new(
-        tokio::runtime::Handle::current(),
-        webdav,
-        cache,
-        crate::fuse::OwnerIds::current(),
-    );
+    let fs = DavFS::new(tokio::runtime::Handle::current(), vfs);
 
-    println!(
-        "\nMounting filesystem at {}...",
-        config.mount_point.display()
-    );
+    println!("\nMounting at {}...", config.mount_point.display());
     println!("Press Ctrl+C to unmount\n");
 
-    // fuser 0.18 takes a Config rather than a bare Vec<MountOption>.
-    // n_threads/clone_fd are left at their defaults here; Phase 6 turns them up
-    // once the handlers no longer block the event loop.
-    // Config is #[non_exhaustive], so build it by mutating the default.
     let mut options = fuser::Config::default();
     options.mount_options = vec![
         fuser::MountOption::FSName("davfs-sync".to_string()),
-        fuser::MountOption::RO, // Read-only for PoC
+        fuser::MountOption::Subtype("davfs".to_string()),
+        fuser::MountOption::RO,
+        fuser::MountOption::NoAtime,
     ];
+    // Several event loops, each with its own fd. Combined with handlers that
+    // spawn rather than block, one slow request no longer stalls the mount.
+    options.n_threads = Some(4);
+    options.clone_fd = true;
 
-    // Setup signal handler for clean unmount
-    let mount_point_for_signal = config.mount_point.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        println!("\n\nReceived Ctrl+C, unmounting...");
-        // Try to unmount
-        let _ = std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(&mount_point_for_signal)
-            .output();
-        std::process::exit(0);
-    });
-
-    // Spawn blocking mount operation in a separate thread to avoid runtime conflicts
     let mount_point = config.mount_point.clone();
     let mount_result =
         tokio::task::spawn_blocking(move || fuser::mount(fs, &mount_point, &options)).await?;
 
+    meta.close().await;
     mount_result?;
 
     println!("\nFilesystem unmounted.");

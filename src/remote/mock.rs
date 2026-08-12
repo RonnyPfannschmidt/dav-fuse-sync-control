@@ -130,6 +130,10 @@ impl MockRemote {
             parent: Some(NodeId(parent.to_string())),
             kind: NodeKind::ExportOnly,
             size: SizeHint::Unknown,
+            // The naming pipeline needs the mime type to choose an export
+            // extension; without it the node shows up with no extension at all.
+            mime: Some("application/vnd.google-apps.document".to_string()),
+            validator: Some(Validator::Etag(format!("\"{name}-export\""))),
             ..RemoteEntry::file(id.clone(), name, 0)
         };
         st.content
