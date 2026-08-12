@@ -6,7 +6,7 @@
 //! called `libc::getuid()` directly, which makes the result machine-dependent
 //! and unsnapshotable.
 
-use fuser::{FileAttr, FileType};
+use fuser::{FileAttr, FileType, INodeNo};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Ownership reported for every node. Injected rather than read from libc so
@@ -85,7 +85,7 @@ pub fn to_file_attr(meta: &NodeMeta, owner: OwnerIds) -> FileAttr {
     let time = meta.mtime.map(to_system_time).unwrap_or(UNIX_EPOCH);
 
     FileAttr {
-        ino: meta.ino,
+        ino: INodeNo(meta.ino),
         size: meta.size,
         blocks: meta.size.div_ceil(512),
         atime: time,
@@ -118,6 +118,11 @@ mod tests {
         uid: 1000,
         gid: 1000,
     };
+
+    #[test]
+    fn inode_is_carried_through() {
+        assert_eq!(to_file_attr(&NodeMeta::file(42, 0), OWNER).ino, INodeNo(42));
+    }
 
     #[test]
     fn mtime_is_reported_not_discarded() {

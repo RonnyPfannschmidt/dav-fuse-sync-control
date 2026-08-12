@@ -268,8 +268,12 @@ async fn mount_filesystem(name: String) -> Result<()> {
     );
     println!("Press Ctrl+C to unmount\n");
 
-    // Mount options - minimal set to avoid permission issues
-    let options = vec![
+    // fuser 0.18 takes a Config rather than a bare Vec<MountOption>.
+    // n_threads/clone_fd are left at their defaults here; Phase 6 turns them up
+    // once the handlers no longer block the event loop.
+    // Config is #[non_exhaustive], so build it by mutating the default.
+    let mut options = fuser::Config::default();
+    options.mount_options = vec![
         fuser::MountOption::FSName("davfs-sync".to_string()),
         fuser::MountOption::RO, // Read-only for PoC
     ];
@@ -290,7 +294,7 @@ async fn mount_filesystem(name: String) -> Result<()> {
     // Spawn blocking mount operation in a separate thread to avoid runtime conflicts
     let mount_point = config.mount_point.clone();
     let mount_result =
-        tokio::task::spawn_blocking(move || fuser::mount2(fs, &mount_point, &options)).await?;
+        tokio::task::spawn_blocking(move || fuser::mount(fs, &mount_point, &options)).await?;
 
     mount_result?;
 

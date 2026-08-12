@@ -1,7 +1,7 @@
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyXattr, Request,
+    Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, ReplyXattr, Request,
 };
-use libc::ENOENT;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
@@ -272,13 +272,13 @@ impl DavFS {
 }
 
 impl Filesystem for DavFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        tracing::debug!("lookup: parent={}, name={:?}", parent, name);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        tracing::debug!("lookup: parent={:?}, name={:?}", parent, name);
 
-        let parent_path = match self.get_path(parent) {
+        let parent_path = match self.get_path(parent.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -286,7 +286,7 @@ impl Filesystem for DavFS {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -328,7 +328,7 @@ impl Filesystem for DavFS {
                     entries
                 }
                 Err(_) => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -338,15 +338,16 @@ impl Filesystem for DavFS {
             if entry.name == name_str {
                 let ino = self.get_or_create_inode(&full_path);
                 let attr = self.attr_for(ino, &entry);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
                 return;
             }
         }
-        reply.error(ENOENT);
+        reply.error(Errno::ENOENT);
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        tracing::debug!("getattr: ino={}", ino);
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        tracing::debug!("getattr: ino={:?}", ino);
+        let ino = ino.0;
 
         if ino == ROOT_INO {
             reply.attr(&TTL, &to_file_attr(&NodeMeta::dir(ROOT_INO), self.owner));
@@ -356,7 +357,7 @@ impl Filesystem for DavFS {
         let path = match self.get_path(ino) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -419,23 +420,24 @@ impl Filesystem for DavFS {
                 return;
             }
         }
-        reply.error(ENOENT);
+        reply.error(Errno::ENOENT);
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        tracing::debug!("readdir: ino={}, offset={}", ino, offset);
+        tracing::debug!("readdir: ino={:?}, offset={}", ino, offset);
+        let ino = ino.0;
 
         let dir_path = match self.get_path(ino) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -486,7 +488,7 @@ impl Filesystem for DavFS {
 
                         // Still return . and ..
                         for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-                            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                            if reply.add(INodeNo(entry.0), (i + 1) as u64, entry.1, entry.2) {
                                 break;
                             }
                         }
@@ -515,7 +517,7 @@ impl Filesystem for DavFS {
         }
 
         for (i, entry) in all_entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+            if reply.add(INodeNo(entry.0), (i + 1) as u64, entry.1, entry.2) {
                 break;
             }
         }
@@ -524,31 +526,31 @@ impl Filesystem for DavFS {
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         _size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        tracing::debug!("read: ino={}, offset={}", ino, offset);
+        tracing::debug!("read: ino={:?}, offset={}", ino, offset);
 
         // For PoC: Always return "no network" error when trying to read file content
         tracing::error!("Read operation not supported (PoC: no network error)");
-        reply.error(libc::ENETUNREACH); // Network unreachable
+        reply.error(Errno::ENETUNREACH);
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        tracing::debug!("open: ino={}", ino);
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        tracing::debug!("open: ino={:?}", ino);
         // Allow opening files, but read will fail
-        reply.opened(0, 0);
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
-    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
-        tracing::debug!("listxattr: ino={}, size={}", ino, size);
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        tracing::debug!("listxattr: ino={:?}, size={}", ino, size);
 
         // We expose user.davfs.state xattr
         let xattr_name = "user.davfs.state";
@@ -564,22 +566,23 @@ impl Filesystem for DavFS {
             buffer.push(0); // null terminator
             reply.data(&buffer);
         } else {
-            reply.error(libc::ERANGE);
+            reply.error(Errno::ERANGE);
         }
     }
 
-    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
-        tracing::debug!("getxattr: ino={}, name={:?}, size={}", ino, name, size);
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        tracing::debug!("getxattr: ino={:?}, name={:?}, size={}", ino, name, size);
+        let ino = ino.0;
 
         if name != "user.davfs.state" {
-            reply.error(libc::ENODATA);
+            reply.error(Errno::ENODATA);
             return;
         }
 
         let path = match self.get_path(ino) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -633,7 +636,7 @@ impl Filesystem for DavFS {
         } else if size >= value.len() as u32 {
             reply.data(value);
         } else {
-            reply.error(libc::ERANGE);
+            reply.error(Errno::ERANGE);
         }
     }
 }

@@ -88,6 +88,12 @@ impl RemoteError {
         }
     }
 
+    /// The same mapping as [`Self::errno`], in the form fuser's reply types
+    /// want.
+    pub fn to_errno(&self) -> fuser::Errno {
+        fuser::Errno::from_i32(self.errno())
+    }
+
     /// Whether retrying with backoff could plausibly succeed.
     pub fn is_retryable(&self) -> bool {
         matches!(

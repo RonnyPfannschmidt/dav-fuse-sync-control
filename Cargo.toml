@@ -23,7 +23,7 @@ path = "src/main.rs"
 # pkg-config build dependency -- which is what .cargo/config.toml used to exist
 # to satisfy. fuser then uses its pure-Rust mount path and shells out to the
 # `fusermount3` binary at runtime.
-fuser = { version = "0.14", default-features = false }
+fuser = { version = "0.18", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
