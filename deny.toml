@@ -1,0 +1,22 @@
+# cargo-deny configuration.
+#
+# `bans` earns its keep in a credential-handling binary: this tree is one
+# dependency bump away from carrying two rustls majors or two zbus majors, and
+# duplicate crypto stacks are a real problem rather than a style nit.
+#
+# `licenses` is deliberately not enabled. It is a wall of allow-list curation
+# that buys nothing until someone packages this for a distribution; add it then.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+# Start at warn so the first run is informative rather than a wall of failures.
+# Flip to "deny" once the tree is clean.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

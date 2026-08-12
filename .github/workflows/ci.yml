@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      # No fuse3 and no rclone here: these tiers deliberately need neither, so
+      # a broken runner image cannot silently disable them.
+      - name: Unit, parser and cache tests
+        run: cargo nextest run --locked --lib --bins --test propfind
+
+      - run: cargo test --locked --doc
+
+      - name: Fail on forgotten snapshot updates
+        run: |
+          if find tests/snapshots -name '*.snap.new' -print -quit | grep -q .; then
+            echo "::error::pending insta snapshots; run 'cargo insta review'"
+            find tests/snapshots -name '*.snap.new'
+            exit 1
+          fi
+
+  # Live tests against a real WebDAV server. Needs rclone but not /dev/fuse.
+  live:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Install rclone (pinned)
+        env:
+          RCLONE_VERSION: v1.74.3
+        run: |
+          curl -fsSL -o /tmp/rclone.zip \
+            "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          unzip -j -d /tmp/rclone /tmp/rclone.zip '*/rclone'
+          sudo install -m0755 /tmp/rclone/rclone /usr/local/bin/rclone
+          rclone version
+
+      - name: WebDAV client against rclone
+        env:
+          # Turns "rclone missing -> skip" into a hard failure, so a runner
+          # image regression shows up red rather than green-with-skips.
+          DAVFS_E2E_REQUIRE: "1"
+        run: cargo nextest run --locked --test webdav_live
+
+      - name: Clean up stray rclone processes
+        if: always()
+        run: pkill -f 'rclone serve webdav' || true
+
+  # Real FUSE mounts. MUST be a VM job: /dev/fuse is absent in `container:` jobs
+  # unless they add --device /dev/fuse --cap-add SYS_ADMIN.
+  e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Install fuse3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+
+      - name: Install rclone (pinned)
+        env:
+          RCLONE_VERSION: v1.74.3
+        run: |
+          curl -fsSL -o /tmp/rclone.zip \
+            "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          unzip -j -d /tmp/rclone /tmp/rclone.zip '*/rclone'
+          sudo install -m0755 /tmp/rclone/rclone /usr/local/bin/rclone
+
+      - name: Allow unprivileged FUSE mounts
+        run: |
+          printf 'user_allow_other\nmount_max = 10000\n' | sudo tee -a /etc/fuse.conf
+          cat /etc/fuse.conf
+
+      - name: Preflight
+        run: |
+          test -c /dev/fuse
+          ls -l /dev/fuse
+          command -v fusermount3
+          # Existence is not enough: in an unprivileged container the node is
+          # there but open() gives EPERM.
+          python3 -c "import os; os.close(os.open('/dev/fuse', os.O_RDWR))"
+
+      - name: FUSE end-to-end suite
+        env:
+          DAVFS_E2E_REQUIRE: "1"
+          RUST_LOG: davfs_sync=debug
+        # One process per test, serialized: a wedged mount must not poison a
+        # sibling test.
+        run: |
+          if ls tests/e2e_*.rs >/dev/null 2>&1; then
+            cargo nextest run --locked --test-threads 1 -E 'binary(/^e2e_/)'
+          else
+            echo "no e2e_* test binaries yet; skipping"
+          fi
+
+      - name: Sweep leaked mounts
+        if: always()
+        run: |
+          awk '$3 ~ /^fuse/ { print $2 }' /proc/self/mounts | while read -r m; do
+            echo "leaked mount: $m"
+            fusermount3 -uz "$m" || true
+          done
+          pkill -f 'rclone serve webdav' || true
+
+  units:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify systemd units
+        run: |
+          if [ ! -d systemd ]; then
+            echo "no systemd/ directory yet; skipping"
+            exit 0
+          fi
+          # systemd-analyze insists ExecStart= exists.
+          sudo install -m0755 /bin/true /usr/bin/davfs-sync
+          # Verifying a template by path exits 1: systemd substitutes
+          # `test_instance` and then cannot find a unit by that name. Verify a
+          # renamed instance copy instead.
+          d="$(mktemp -d)"
+          for f in systemd/*.service; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"
+            cp "$f" "$d/${base%@.service}@ci.service"
+          done
+          cp systemd/*.target "$d/" 2>/dev/null || true
+          systemd-analyze --user verify --man=no --recursive-errors=no "$d"/*
+      - name: Shellcheck
+        run: |
+          if ls scripts/*.sh >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+            shellcheck scripts/*.sh
+          else
+            echo "no scripts/ yet; skipping"
+          fi
