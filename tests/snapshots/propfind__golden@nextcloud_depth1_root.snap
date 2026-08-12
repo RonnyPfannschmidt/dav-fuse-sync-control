@@ -1,0 +1,9 @@
+---
+source: tests/propfind.rs
+description: "fixture: nextcloud_depth1_root.xml"
+---
+self:  (dir=true)
+self_etag: "6900aa11bb22c"
+children: 2
+  - path="Documents" name="Documents" dir=true size=0 mtime=1786361400 etag="6900bb22cc33d"
+  - path="Ferien & Reisen.pdf" name="Ferien & Reisen.pdf" dir=false size=1048576 mtime=1786263300 etag="abc123def456"

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<multistatus xmlns="DAV:">
+  <response>
+    <href>/share/</href>
+    <propstat><prop><resourcetype><collection/></resourcetype><getetag>"root-1"</getetag></prop><status>HTTP/1.1 200 OK</status></propstat>
+  </response>
+  <response>
+    <href>/share/notes.md</href>
+    <propstat><prop><resourcetype/><getcontentlength>77</getcontentlength><getlastmodified>Fri, 07 Aug 2026 22:01:02 GMT</getlastmodified></prop><status>HTTP/1.1 200 OK</status></propstat>
+  </response>
+</multistatus>

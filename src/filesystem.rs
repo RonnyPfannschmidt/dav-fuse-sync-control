@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::fuse::attr::{to_file_attr, NodeMeta, OwnerIds};
 use crate::store::MetaStore;
-use crate::webdav::{DavEntry, WebDavClient};
+use crate::webdav::{DavEntry, ListResult, WebDavClient};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -99,18 +99,24 @@ impl DavFS {
         let in_progress = self.refresh_in_progress.clone();
 
         tokio::spawn(async move {
-            if let Some((_, etag)) = cache.get_with_etag(&path_clone).await {
-                if let Ok((new_entries, new_etag)) = webdav
-                    .list_dir_with_etag(&dav_path_str, etag.as_deref())
-                    .await
-                {
-                    if !new_entries.is_empty() {
-                        let _ = cache
-                            .insert(path_clone.clone(), new_entries, new_etag)
-                            .await;
-                        tracing::debug!("Background refresh completed for {}", path_clone);
-                    }
+            let etag = cache
+                .get_with_etag(&path_clone)
+                .await
+                .and_then(|(_, etag)| etag);
+
+            match webdav.list_dir(&dav_path_str, etag.as_deref()).await {
+                // An explicit variant, not an empty Vec. The PoC could not tell
+                // 304 from "the directory is now empty", and guarded the write
+                // back with `!entries.is_empty()` -- so deleting the last file
+                // in a directory never propagated to the cache.
+                Ok(ListResult::NotModified) => {
+                    tracing::debug!("{} unchanged", path_clone);
                 }
+                Ok(ListResult::Modified { entries, etag }) => {
+                    let _ = cache.insert(path_clone.clone(), entries, etag).await;
+                    tracing::debug!("Background refresh completed for {}", path_clone);
+                }
+                Err(e) => tracing::debug!("Background refresh of {} failed: {}", path_clone, e),
             }
 
             // Remove from in-progress set
@@ -119,117 +125,6 @@ impl DavFS {
 
         true
     }
-
-    /* Disabled: Too aggressive, initial prefetch + on-demand refresh is sufficient
-    fn prefetch_subdirectories(&self, dir_path: &str, entries: &[crate::webdav::DavEntry]) {
-        // Background prefetch of subdirectories for faster navigation
-        // Go 3 levels deep for rapid prefetching
-        let subdirs: Vec<_> = entries.iter()
-            .filter(|e| e.is_dir)
-            .map(|e| {
-                if dir_path == "/" {
-                    format!("/{}", e.name)
-                } else {
-                    format!("{}/{}", dir_path, e.name)
-                }
-            })
-            .collect();
-
-        if subdirs.is_empty() {
-            return;
-        }
-
-        let webdav = self.webdav.clone();
-        let cache = self.dir_cache.clone();
-
-        // Spawn background task to prefetch recursively
-        std::thread::spawn(move || {
-            // Create a new runtime in the background thread
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            fn prefetch_recursive(
-                rt: &tokio::runtime::Runtime,
-                webdav: &crate::webdav::WebDavClient,
-                cache: &crate::store::MetaStore,
-                path: &str,
-                depth: u32,
-                max_depth: u32,
-            ) {
-                if depth >= max_depth {
-                    return;
-                }
-
-                // Check if already cached and get etag for conditional request
-                let cached_etag = rt.block_on(cache.get_with_etag(path)).and_then(|(_, etag)| etag);
-
-                // Fetch directory listing with conditional request
-                let dav_path = if path == "/" { "" } else { &path[1..] };
-                match rt.block_on(webdav.list_dir_with_etag(dav_path, cached_etag.as_deref())) {
-                    Ok((entries, etag)) => {
-                        // If we got HTTP 304, entries will be empty - use cached data
-                        if entries.is_empty() && cached_etag.is_some() {
-                            tracing::info!("Directory {} not modified (HTTP 304), using cached data", path);
-                            // Still recurse into subdirectories
-                            if let Some((cached_entries, _)) = rt.block_on(cache.get_with_etag(path)) {
-                                let subdirs: Vec<_> = cached_entries.iter()
-                                    .filter(|e| e.is_dir)
-                                    .map(|e| {
-                                        if path == "/" {
-                                            format!("/{}", e.name)
-                                        } else {
-                                            format!("{}/{}", path, e.name)
-                                        }
-                                    })
-                                    .collect();
-
-                                for subdir in subdirs {
-                                    prefetch_recursive(rt, webdav, cache, &subdir, depth + 1, max_depth);
-                                }
-                            }
-                            return;
-                        }
-
-                        let num_entries = entries.len();
-
-                        // Find subdirectories before we move entries
-                        let subdirs: Vec<_> = entries.iter()
-                            .filter(|e| e.is_dir)
-                            .map(|e| {
-                                if path == "/" {
-                                    format!("/{}", e.name)
-                                } else {
-                                    format!("{}/{}", path, e.name)
-                                }
-                            })
-                            .collect();
-
-                        // Cache this directory with etag
-                        let _ = rt.block_on(cache.insert(path.to_string(), entries, etag.clone()));
-
-                        tracing::info!("Prefetched {} (depth {}, {} entries, {} subdirs, etag: {:?})",
-                                      path, depth, num_entries, subdirs.len(), etag);
-
-                        // Recursively prefetch subdirectories
-                        for subdir in subdirs {
-                            prefetch_recursive(rt, webdav, cache, &subdir, depth + 1, max_depth);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to prefetch {}: {}", path, e);
-                    }
-                }
-            }
-
-            // Prefetch up to 4 levels deep for very aggressive caching
-            for subdir_path in subdirs {
-                prefetch_recursive(&rt, &webdav, &cache, &subdir_path, 1, 4);
-            }
-        });
-    }
-    */
 
     fn get_or_create_inode(&self, path: &str) -> u64 {
         let mut path_to_inode = self.path_to_inode.lock().unwrap();
@@ -315,11 +210,8 @@ impl Filesystem for DavFS {
             } else {
                 &parent_path[1..]
             };
-            match self
-                .rt
-                .block_on(self.webdav.list_dir_with_etag(dav_path, None))
-            {
-                Ok((entries, etag)) => {
+            match self.rt.block_on(self.webdav.list_dir(dav_path, None)) {
+                Ok(ListResult::Modified { entries, etag }) => {
                     let _ = self.rt.block_on(self.dir_cache.insert(
                         parent_path.clone(),
                         entries.clone(),
@@ -327,8 +219,12 @@ impl Filesystem for DavFS {
                     ));
                     entries
                 }
-                Err(_) => {
-                    reply.error(Errno::ENOENT);
+                // Nothing was cached, so no validator was sent; 304 is impossible.
+                Ok(ListResult::NotModified) => Vec::new(),
+                Err(e) => {
+                    // The typed errno matters: replying ENOENT for an
+                    // unreachable server tells applications the file is gone.
+                    reply.error(e.to_errno());
                     return;
                 }
             }
@@ -392,11 +288,8 @@ impl Filesystem for DavFS {
             } else {
                 &parent_path[1..]
             };
-            match self
-                .rt
-                .block_on(self.webdav.list_dir_with_etag(dav_path, None))
-            {
-                Ok((entries, etag)) => {
+            match self.rt.block_on(self.webdav.list_dir(dav_path, None)) {
+                Ok(ListResult::Modified { entries, etag }) => {
                     let _ = self.rt.block_on(self.dir_cache.insert(
                         parent_path.to_string(),
                         entries.clone(),
@@ -404,10 +297,12 @@ impl Filesystem for DavFS {
                     ));
                     entries
                 }
-                Err(_) => {
-                    // Fallback to generic file attributes
-                    let attr = to_file_attr(&NodeMeta::file(ino, 1024), self.owner);
-                    reply.attr(&TTL, &attr);
+                Ok(ListResult::NotModified) => Vec::new(),
+                Err(e) => {
+                    // Previously this invented a 1024-byte file attribute for
+                    // anything that failed to fetch, so a transient error
+                    // surfaced as a real file of the wrong size.
+                    reply.error(e.to_errno());
                     return;
                 }
             }
@@ -462,13 +357,10 @@ impl Filesystem for DavFS {
             } else {
                 // No cache at all, must fetch synchronously (fallback)
                 tracing::info!("No cache for {}, fetching synchronously", dir_path);
-                match self
-                    .rt
-                    .block_on(self.webdav.list_dir_with_etag(dav_path, None))
-                {
-                    Ok((entries, etag)) => {
+                match self.rt.block_on(self.webdav.list_dir(dav_path, None)) {
+                    Ok(ListResult::Modified { entries, etag }) => {
                         tracing::info!(
-                            "Listed {} entries from WebDAV at path {} with etag: {:?}",
+                            "Listed {} entries at {} (etag {:?})",
                             entries.len(),
                             dav_path,
                             etag
@@ -478,13 +370,11 @@ impl Filesystem for DavFS {
                             entries.clone(),
                             etag,
                         ));
-
-                        // Note: prefetch_subdirectories disabled - initial prefetch + on-demand refresh is sufficient
-
                         entries
                     }
+                    Ok(ListResult::NotModified) => Vec::new(),
                     Err(e) => {
-                        tracing::error!("Failed to list directory: {}", e);
+                        tracing::error!("Failed to list {}: {}", dir_path, e);
 
                         // Still return . and ..
                         for (i, entry) in entries.iter().enumerate().skip(offset as usize) {

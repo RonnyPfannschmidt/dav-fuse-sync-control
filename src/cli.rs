@@ -121,26 +121,75 @@ async fn setup_mount(
     Ok(())
 }
 
-/// Perform initial sync: recursive PROPFIND and cache population
-async fn initial_sync(webdav: &webdav::WebDavClient, cache: &MetaStore) -> Result<usize> {
-    tracing::info!("Starting recursive prefetch (depth=3)...");
+/// Populate the cache before the filesystem is exposed.
+///
+/// A breadth-first crawl of `Depth: 1` listings, not one `Depth: infinity`
+/// request. Nextcloud and SabreDAV reject `Depth: infinity` outright with
+/// `403 Propfind-Finite-Depth`, so the PoC's "one recursive PROPFIND" silently
+/// failed against the exact servers it was written for, and the mount fell back
+/// to fetching every directory synchronously on first access.
+///
+/// Each level is fetched concurrently, bounded by `max_concurrent`.
+async fn initial_sync(
+    webdav: &webdav::WebDavClient,
+    cache: &MetaStore,
+    max_depth: usize,
+    max_concurrent: usize,
+) -> Result<usize> {
+    use futures::stream::{self, StreamExt};
 
-    // Single recursive PROPFIND request with depth limit
-    let directories = webdav.list_dir_recursive("", 3).await?;
-    tracing::info!(
-        "Recursive prefetch returned {} directories",
-        directories.len()
-    );
+    let mut frontier = vec![String::from("/")];
+    let mut cached = 0usize;
 
-    let dir_count = directories.len();
+    for depth in 0..max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        tracing::info!("initial sync: level {} ({} dirs)", depth, frontier.len());
 
-    // Cache all directories
-    for (path, entries) in directories {
-        cache.insert(path.clone(), entries.clone(), None).await?;
-        tracing::info!("Cached: {} ({} entries)", path, entries.len());
+        let results: Vec<(String, Option<Vec<webdav::DavEntry>>, Option<String>)> =
+            stream::iter(frontier.iter().cloned())
+                .map(|path| async move {
+                    let dav_path = path.trim_start_matches('/');
+                    match webdav.list_dir(dav_path, None).await {
+                        Ok(webdav::ListResult::Modified { entries, etag }) => {
+                            (path, Some(entries), etag)
+                        }
+                        // No validator was sent, so this cannot happen; treat it
+                        // as "nothing to store" rather than asserting.
+                        Ok(webdav::ListResult::NotModified) => (path, None, None),
+                        Err(e) => {
+                            tracing::warn!("initial sync: {} failed: {}", path, e);
+                            (path, None, None)
+                        }
+                    }
+                })
+                .buffer_unordered(max_concurrent)
+                .collect()
+                .await;
+
+        let mut next = Vec::new();
+        for (path, entries, etag) in results {
+            let Some(entries) = entries else { continue };
+
+            for e in entries.iter().filter(|e| e.is_dir) {
+                next.push(if path == "/" {
+                    format!("/{}", e.name)
+                } else {
+                    format!("{}/{}", path, e.name)
+                });
+            }
+
+            // The validator is stored, so the first background revalidation of
+            // each directory is conditional. The PoC passed `None` here, which
+            // meant every directory was re-fetched in full at least once.
+            cache.insert(path, entries, etag).await?;
+            cached += 1;
+        }
+        frontier = next;
     }
 
-    Ok(dir_count)
+    Ok(cached)
 }
 
 async fn mount_filesystem(name: String) -> Result<()> {
@@ -244,7 +293,7 @@ async fn mount_filesystem(name: String) -> Result<()> {
 
     // Perform initial sync before creating filesystem
     println!("Starting initial sync...");
-    match initial_sync(&webdav, &cache).await {
+    match initial_sync(&webdav, &cache, 3, 4).await {
         Ok(dir_count) => {
             println!("✓ Initial sync complete! Cached {} directories", dir_count);
         }

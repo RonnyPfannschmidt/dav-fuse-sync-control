@@ -1,0 +1,5 @@
+---
+source: tests/propfind.rs
+description: "fixture: sabredav_403_finite_depth.xml"
+---
+ERROR: malformed response: response is not a DAV: multistatus

@@ -1,0 +1,13 @@
+---
+source: tests/propfind.rs
+description: "fixture: rclone_depth1_root.xml"
+---
+self:  (dir=true)
+children: 7
+  - path="apostrophe's.txt" name="apostrophe's.txt" dir=false size=1 mtime=1786516627 etag="18cafb685a0833cb1"
+  - path="empty" name="empty" dir=true size=0 mtime=1786516627
+  - path="hash#and&.txt" name="hash#and&.txt" dir=false size=1 mtime=1786516627 etag="18cafb685a0833cb1"
+  - path="nested" name="nested" dir=true size=0 mtime=1786516627
+  - path="plain.txt" name="plain.txt" dir=false size=6 mtime=1786516627 etag="18cafb685a0833cb6"
+  - path="spaces in name.txt" name="spaces in name.txt" dir=false size=1 mtime=1786516627 etag="18cafb685a0833cb1"
+  - path="ümlaut-Ä.txt" name="ümlaut-Ä.txt" dir=false size=1 mtime=1786516627 etag="18cafb685a0833cb1"

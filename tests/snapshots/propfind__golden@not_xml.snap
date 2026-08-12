@@ -1,0 +1,5 @@
+---
+source: tests/propfind.rs
+description: "fixture: not_xml.xml"
+---
+ERROR: malformed response: response is not a DAV: multistatus

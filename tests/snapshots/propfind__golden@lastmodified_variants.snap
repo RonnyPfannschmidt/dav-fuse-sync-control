@@ -1,0 +1,10 @@
+---
+source: tests/propfind.rs
+description: "fixture: lastmodified_variants.xml"
+---
+self:  (dir=true)
+children: 4
+  - path="gmt.txt" name="gmt.txt" dir=false size=0 mtime=1786516627
+  - path="offset.txt" name="offset.txt" dir=false size=0 mtime=1786516627
+  - path="absent.txt" name="absent.txt" dir=false size=0
+  - path="garbage.txt" name="garbage.txt" dir=false size=0

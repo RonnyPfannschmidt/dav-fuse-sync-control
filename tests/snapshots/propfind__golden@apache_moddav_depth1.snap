@@ -1,0 +1,8 @@
+---
+source: tests/propfind.rs
+description: "fixture: apache_moddav_depth1.xml"
+---
+self:  (dir=true)
+self_etag: "1000-63a1bc2f00000"
+children: 1
+  - path="report.txt" name="report.txt" dir=false size=2048 mtime=1786437912 etag="800-63a1bb0000000"

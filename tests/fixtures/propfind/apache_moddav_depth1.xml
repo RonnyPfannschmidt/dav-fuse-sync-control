@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:ns0="DAV:">
+<D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+<D:href>/dav/</D:href>
+<D:propstat>
+<D:prop>
+<lp1:resourcetype><D:collection/></lp1:resourcetype>
+<lp1:getlastmodified>Tue, 11 Aug 2026 09:00:00 GMT</lp1:getlastmodified>
+<lp1:getetag>"1000-63a1bc2f00000"</lp1:getetag>
+<lp2:executable>F</lp2:executable>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+<D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+<D:href>/dav/report.txt</D:href>
+<D:propstat>
+<D:prop>
+<lp1:resourcetype/>
+<lp1:getcontentlength>2048</lp1:getcontentlength>
+<lp1:getlastmodified>Tue, 11 Aug 2026 08:45:12 GMT</lp1:getlastmodified>
+<lp1:getetag>"800-63a1bb0000000"</lp1:getetag>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+<D:propstat>
+<D:prop><D:displayname/></D:prop>
+<D:status>HTTP/1.1 404 Not Found</D:status>
+</D:propstat>
+</D:response>
+</D:multistatus>

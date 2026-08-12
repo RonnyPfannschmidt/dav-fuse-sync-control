@@ -1,0 +1,11 @@
+---
+source: tests/propfind.rs
+description: "fixture: percent_encoded_hrefs.xml"
+---
+self:  (dir=true)
+children: 5
+  - path="spaces in name.txt" name="spaces in name.txt" dir=false size=1
+  - path="ümlaut-Ä.txt" name="ümlaut-Ä.txt" dir=false size=2
+  - path="hash#and&.txt" name="hash#and&.txt" dir=false size=3
+  - path="plus+sign.txt" name="plus+sign.txt" dir=false size=4
+  - path="100%done.txt" name="100%done.txt" dir=false size=5

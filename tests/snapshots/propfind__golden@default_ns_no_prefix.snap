@@ -1,0 +1,8 @@
+---
+source: tests/propfind.rs
+description: "fixture: default_ns_no_prefix.xml"
+---
+self:  (dir=true)
+self_etag: "root-1"
+children: 1
+  - path="notes.md" name="notes.md" dir=false size=77 mtime=1786140062

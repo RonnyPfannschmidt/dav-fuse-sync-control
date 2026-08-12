@@ -1,0 +1,7 @@
+---
+source: tests/propfind.rs
+description: "fixture: rclone_depth1_subdir.xml"
+---
+self:  (dir=true)
+children: 1
+  - path="deep.txt" name="deep.txt" dir=false size=5 mtime=1786516627 etag="18cafb685a0833cb5"

@@ -1,0 +1,7 @@
+---
+source: tests/propfind.rs
+description: "fixture: empty_collection.xml"
+---
+self:  (dir=true)
+self_etag: "empty-1"
+children: 0

@@ -27,6 +27,7 @@ fuser = { version = "0.18", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 # HTTP/WebDAV client.
 # rustls rather than the default native-tls: it removes the only system library
@@ -39,7 +40,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 url = "2.5"
-urlencoding = "2.1"
+percent-encoding = "2.3"
+
+# WebDAV response parsing. Namespace-aware, so `d:`, `D:` and default-namespace
+# servers are all handled without ever writing a prefix string.
+quick-xml = "0.41"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
@@ -76,3 +81,4 @@ rpassword = "7.3"
 
 [dev-dependencies]
 tempfile = "3"
+insta = { version = "1", features = ["yaml", "filters"] }

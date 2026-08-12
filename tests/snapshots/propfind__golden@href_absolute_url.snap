@@ -1,0 +1,7 @@
+---
+source: tests/propfind.rs
+description: "fixture: href_absolute_url.xml"
+---
+self:  (dir=true)
+children: 1
+  - path="file.bin" name="file.bin" dir=false size=5

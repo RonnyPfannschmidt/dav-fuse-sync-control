@@ -1,0 +1,5 @@
+---
+source: tests/propfind.rs
+description: "fixture: truncated.xml"
+---
+ERROR: malformed response: malformed XML: syntax error: tag not closed: `>` not found before end of input
