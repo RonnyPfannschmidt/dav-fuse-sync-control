@@ -142,6 +142,25 @@ async fn setup_mount(
     Ok(())
 }
 
+/// Perform initial sync: recursive PROPFIND and cache population
+async fn initial_sync(webdav: &webdav::WebDavClient, cache: &cache::DirectoryCache) -> Result<usize> {
+    tracing::info!("Starting recursive prefetch (depth=3)...");
+    
+    // Single recursive PROPFIND request with depth limit
+    let directories = webdav.list_dir_recursive("", 3).await?;
+    tracing::info!("Recursive prefetch returned {} directories", directories.len());
+    
+    let dir_count = directories.len();
+    
+    // Cache all directories
+    for (path, entries) in directories {
+        cache.insert(path.clone(), entries.clone(), None).await?;
+        tracing::info!("Cached: {} ({} entries)", path, entries.len());
+    }
+    
+    Ok(dir_count)
+}
+
 async fn mount_filesystem(name: String) -> Result<()> {
     println!("Loading mount configuration for '{}'...", name);
 
@@ -242,12 +261,20 @@ async fn mount_filesystem(name: String) -> Result<()> {
     let cache = cache::DirectoryCache::new(&cache_db_path, std::time::Duration::from_secs(5)).await?;
     println!("✓ Cache initialized");
 
-    // Create filesystem (pass pre-created cache to avoid runtime-in-async issues)
-    let fs = DavFS::new(webdav, cache);
+    // Perform initial sync before creating filesystem
+    println!("Starting initial sync...");
+    match initial_sync(&webdav, &cache).await {
+        Ok(dir_count) => {
+            println!("✓ Initial sync complete! Cached {} directories", dir_count);
+        }
+        Err(e) => {
+            eprintln!("⚠ Initial sync failed: {}", e);
+            eprintln!("Will mount with stale cache (if available)");
+        }
+    }
     
-    // Start aggressive background prefetching
-    println!("Starting background prefetch...");
-    fs.prefetch_initial();
+    // Create filesystem with populated cache
+    let fs = DavFS::new(webdav, cache);
 
     println!("\nMounting filesystem at {}...", config.mount_point.display());
     println!("Press Ctrl+C to unmount\n");

@@ -3,7 +3,7 @@ use fuser::{
     ReplyXattr,
 };
 use libc::ENOENT;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -24,6 +24,8 @@ pub struct DavFS {
     next_inode: Arc<Mutex<u64>>,
     // Directory listing cache
     dir_cache: DirectoryCache,
+    // Track paths currently being refreshed to avoid duplicates
+    refresh_in_progress: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DavFS {
@@ -40,42 +42,57 @@ impl DavFS {
             path_to_inode: Arc::new(Mutex::new(path_to_inode)),
             next_inode: Arc::new(Mutex::new(2)),
             dir_cache,
+            refresh_in_progress: Arc::new(Mutex::new(HashSet::new())),
         }
     }
     
-    pub fn prefetch_initial(&self) {
-        // Aggressive initial prefetch: single recursive PROPFIND up to depth 2
+    /// Schedule a background refresh for a path if not already in progress
+    /// Returns true if refresh was scheduled, false if already in progress or not needed
+    fn schedule_refresh(&self, path: &str) -> bool {
+        // Check if already refreshing this path
+        {
+            let in_progress = self.refresh_in_progress.lock().unwrap();
+            if in_progress.contains(path) {
+                tracing::debug!("Refresh already in progress for {}, skipping", path);
+                return false;
+            }
+        }
+        
+        // Check if cache is fresh (within TTL) - no need to refresh
+        let handle = tokio::runtime::Handle::current();
+        if handle.block_on(self.dir_cache.get(path)).is_some() {
+            tracing::debug!("Cache is fresh for {}, skipping refresh", path);
+            return false;
+        }
+        
+        // Mark as in progress
+        self.refresh_in_progress.lock().unwrap().insert(path.to_string());
+        
+        // Schedule background refresh
         let webdav = self.webdav.clone();
         let cache = self.dir_cache.clone();
+        let path_clone = path.to_string();
+        let dav_path_str = if path == "/" { String::new() } else { path[1..].to_string() };
+        let in_progress = self.refresh_in_progress.clone();
         
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            
-            tracing::info!("Starting recursive prefetch (depth=3)...");
-            
-            // Single recursive PROPFIND request with depth limit
-            match rt.block_on(webdav.list_dir_recursive("", 3)) {
-                Ok(directories) => {
-                    tracing::info!("Recursive prefetch returned {} directories", directories.len());
-                    
-                    // Cache all directories
-                    for (path, entries) in directories {
-                        let _ = rt.block_on(cache.insert(path.clone(), entries.clone(), None));
-                        tracing::info!("Cached: {} ({} entries)", path, entries.len());
+        tokio::spawn(async move {
+            if let Some((_, etag)) = cache.get_with_etag(&path_clone).await {
+                if let Ok((new_entries, new_etag)) = webdav.list_dir_with_etag(&dav_path_str, etag.as_deref()).await {
+                    if !new_entries.is_empty() {
+                        let _ = cache.insert(path_clone.clone(), new_entries, new_etag).await;
+                        tracing::debug!("Background refresh completed for {}", path_clone);
                     }
-                    
-                    tracing::info!("Initial prefetch complete");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to prefetch: {}", e);
                 }
             }
+            
+            // Remove from in-progress set
+            in_progress.lock().unwrap().remove(&path_clone);
         });
+        
+        true
     }
     
+    /* Disabled: Too aggressive, initial prefetch + on-demand refresh is sufficient
     fn prefetch_subdirectories(&self, dir_path: &str, entries: &[crate::webdav::DavEntry]) {
         // Background prefetch of subdirectories for faster navigation
         // Go 3 levels deep for rapid prefetching
@@ -184,6 +201,7 @@ impl DavFS {
             }
         });
     }
+    */
     
     fn get_or_create_inode(&self, path: &str) -> u64 {
         let mut path_to_inode = self.path_to_inode.lock().unwrap();
@@ -299,27 +317,18 @@ impl Filesystem for DavFS {
             format!("{}/{}", parent_path.trim_end_matches('/'), name_str)
         };
         
-        // Try to list parent directory to find this entry
-        let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
-        
-        // Try cached data first, then make conditional request if available
-        let entries = if let Some((cached, etag)) = tokio::runtime::Handle::current().block_on(self.dir_cache.get_with_etag(&parent_path)) {
-            // Use cached data but make conditional request to check for updates
-            match tokio::runtime::Handle::current().block_on(self.webdav.list_dir_with_etag(dav_path, etag.as_deref())) {
-                Ok((new_entries, new_etag)) => {
-                    if new_entries.is_empty() {
-                        // HTTP 304 - content not modified, use cache
-                        cached
-                    } else {
-                        // HTTP 200 - new content
-                        let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(parent_path.clone(), new_entries.clone(), new_etag));
-                        new_entries
-                    }
-                }
-                Err(_) => cached // Fallback to cache on error
-            }
+        // Always try cache first (even stale), schedule background refresh if needed
+        let entries = if let Some(cached) = tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(&parent_path)) {
+            tracing::debug!("Serving lookup from cache: {}", parent_path);
+            
+            // Schedule background refresh (deduplicates automatically)
+            self.schedule_refresh(&parent_path);
+            
+            cached
         } else {
-            // No cache, fetch fresh
+            // No cache at all, must fetch synchronously (fallback)
+            tracing::info!("No cache for {}, fetching synchronously", parent_path);
+            let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
             match tokio::runtime::Handle::current().block_on(self.webdav.list_dir_with_etag(dav_path, None)) {
                 Ok((entries, etag)) => {
                     let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(parent_path.clone(), entries.clone(), etag));
@@ -376,27 +385,18 @@ impl Filesystem for DavFS {
         
         let name = path.rsplit('/').next().unwrap_or("");
         
-        // List parent to find this entry
-        let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
-        
-        // Try cached data first, then make conditional request if available
-        let entries = if let Some((cached, etag)) = tokio::runtime::Handle::current().block_on(self.dir_cache.get_with_etag(parent_path)) {
-            // Use cached data but make conditional request to check for updates
-            match tokio::runtime::Handle::current().block_on(self.webdav.list_dir_with_etag(dav_path, etag.as_deref())) {
-                Ok((new_entries, new_etag)) => {
-                    if new_entries.is_empty() {
-                        // HTTP 304 - content not modified, use cache
-                        cached
-                    } else {
-                        // HTTP 200 - new content
-                        let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(parent_path.to_string(), new_entries.clone(), new_etag));
-                        new_entries
-                    }
-                }
-                Err(_) => cached // Fallback to cache on error
-            }
+        // Always try cache first (even stale), schedule background refresh if needed
+        let entries = if let Some(cached) = tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(parent_path)) {
+            tracing::debug!("Serving getattr from cache: {}", parent_path);
+            
+            // Schedule background refresh (deduplicates automatically)
+            self.schedule_refresh(parent_path);
+            
+            cached
         } else {
-            // No cache, fetch fresh
+            // No cache at all, must fetch synchronously (fallback)
+            tracing::info!("No cache for {}, fetching synchronously", parent_path);
+            let dav_path = if parent_path == "/" { "" } else { &parent_path[1..] };
             match tokio::runtime::Handle::current().block_on(self.webdav.list_dir_with_etag(dav_path, None)) {
                 Ok((entries, etag)) => {
                     let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(parent_path.to_string(), entries.clone(), etag));
@@ -455,38 +455,23 @@ impl Filesystem for DavFS {
             &dir_path[1..]
         };
         
-        // Try cached data first, then make conditional request if available
-        let dav_entries = if let Some((cached, etag)) = tokio::runtime::Handle::current().block_on(self.dir_cache.get_with_etag(&dir_path)) {
-            tracing::debug!("Using cached entries for path {} with etag: {:?}", dir_path, etag);
-            // Make conditional request to check for updates
-            match tokio::runtime::Handle::current().block_on(self.webdav.list_dir_with_etag(dav_path, etag.as_deref())) {
-                Ok((new_entries, new_etag)) => {
-                    if new_entries.is_empty() {
-                        // HTTP 304 - content not modified, use cache
-                        tracing::info!("Directory {} not modified (HTTP 304), using cached data", dir_path);
-                        cached
-                    } else {
-                        // HTTP 200 - new content
-                        tracing::info!("Directory {} updated, got {} new entries with etag: {:?}", dir_path, new_entries.len(), new_etag);
-                        let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(dir_path.clone(), new_entries.clone(), new_etag));
-                        
-                        // Trigger background prefetch of subdirectories
-                        self.prefetch_subdirectories(&dir_path, &new_entries);
-                        
-                        new_entries
-                    }
-                }
-                Err(_) => cached // Fallback to cache on error
-            }
+        // Always try cache first (even stale), schedule background refresh if needed
+        let dav_entries = if let Some(cached) = tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(&dir_path)) {
+            tracing::debug!("Serving readdir from cache: {}", dir_path);
+            
+            // Schedule background refresh (deduplicates automatically)
+            self.schedule_refresh(&dir_path);
+            
+            cached
         } else {
-            // No cache, fetch fresh
+            // No cache at all, must fetch synchronously (fallback)
+            tracing::info!("No cache for {}, fetching synchronously", dir_path);
             match tokio::runtime::Handle::current().block_on(self.webdav.list_dir_with_etag(dav_path, None)) {
                 Ok((entries, etag)) => {
                     tracing::info!("Listed {} entries from WebDAV at path {} with etag: {:?}", entries.len(), dav_path, etag);
                     let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(dir_path.clone(), entries.clone(), etag));
                     
-                    // Trigger background prefetch of subdirectories
-                    self.prefetch_subdirectories(&dir_path, &entries);
+                    // Note: prefetch_subdirectories disabled - initial prefetch + on-demand refresh is sufficient
                     
                     entries
                 }
@@ -593,26 +578,35 @@ impl Filesystem for DavFS {
             }
         };
         
-        // Determine state based on cache
+        // Determine state based on cache freshness
         let state = if ino == ROOT_INO {
             // Root is always cached
             "cached"
-        } else if path.ends_with('/') || tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(&path)).is_some() {
-            // Directory with cached listing
-            "cached"
+        } else if path.ends_with('/') {
+            // It's a directory - check if we have fresh cache
+            if tokio::runtime::Handle::current().block_on(self.dir_cache.get(&path)).is_some() {
+                "cached" // Fresh cache
+            } else if tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(&path)).is_some() {
+                "cloud" // Stale cache, needs refresh
+            } else {
+                "unknown" // No cache at all
+            }
         } else {
-            // Check if parent directory is cached (which means we know about this entry)
+            // It's a file - check if parent directory has fresh cache
             let parent_path = if let Some(idx) = path.rfind('/') {
                 if idx == 0 { "/" } else { &path[..idx] }
             } else {
                 "/"
             };
             
-            if tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(parent_path)).is_some() {
-                // Parent is cached, so metadata is known but file content is not downloaded
+            if tokio::runtime::Handle::current().block_on(self.dir_cache.get(parent_path)).is_some() {
+                // Parent has fresh cache, file metadata is known but content not downloaded
+                "cloud"
+            } else if tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(parent_path)).is_some() {
+                // Parent has stale cache, metadata might be outdated
                 "cloud"
             } else {
-                // Not in cache at all
+                // Parent not cached at all
                 "unknown"
             }
         };
