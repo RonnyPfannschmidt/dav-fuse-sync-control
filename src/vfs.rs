@@ -700,6 +700,15 @@ impl Vfs {
         &self.meta
     }
 
+    pub fn content(&self) -> &ContentCache {
+        &self.content
+    }
+
+    /// Revalidate one directory now. Used by the background worker.
+    pub async fn revalidate(&self, dir: &NodeId) -> Result<(), RemoteError> {
+        self.refresh_now(dir).await
+    }
+
     /// Populate the cache before the mount is exposed.
     ///
     /// A bounded breadth-first crawl of `Depth: 1` listings, concurrent per

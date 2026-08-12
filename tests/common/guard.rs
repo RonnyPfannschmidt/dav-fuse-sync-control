@@ -44,7 +44,9 @@ pub fn wait_for_mount(path: &Path, timeout: Duration) -> bool {
 pub struct MountGuard {
     session: Option<fuser::BackgroundSession>,
     mountpoint: TempDir,
-    _server: RcloneServer,
+    /// Only set when the server is ours to shut down; a Nextcloud container
+    /// outlives the test.
+    _server: Option<RcloneServer>,
 }
 
 impl MountGuard {
@@ -56,7 +58,16 @@ impl MountGuard {
         Self {
             session: Some(session),
             mountpoint,
-            _server: server,
+            _server: Some(server),
+        }
+    }
+
+    /// For a server the test does not own, such as a Nextcloud container.
+    pub fn without_server(session: fuser::BackgroundSession, mountpoint: TempDir) -> Self {
+        Self {
+            session: Some(session),
+            mountpoint,
+            _server: None,
         }
     }
 

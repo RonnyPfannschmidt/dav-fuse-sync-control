@@ -12,6 +12,7 @@ pub mod fuse;
 pub mod remote;
 pub mod secrets;
 pub mod store;
+pub mod sync;
 pub mod vfs;
 
 pub use error::RemoteError;

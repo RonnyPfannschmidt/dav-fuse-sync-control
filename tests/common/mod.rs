@@ -6,5 +6,6 @@
 #![allow(dead_code)]
 
 pub mod guard;
+pub mod nextcloud;
 pub mod rclone;
 pub mod tree;

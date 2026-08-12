@@ -78,6 +78,78 @@ jobs:
         if: always()
         run: pkill -f 'rclone serve webdav' || true
 
+  # Against the server this project actually targets.
+  #
+  # A service container rather than `podman run`: GitHub sets up the network and
+  # health-gates the job on it. Nextcloud with SQLite installs in ~30s, which is
+  # cheap enough to run on every push.
+  nextcloud:
+    runs-on: ubuntu-24.04
+    services:
+      nextcloud:
+        image: nextcloud:30-apache
+        ports:
+          - 8080:80
+        env:
+          SQLITE_DATABASE: nextcloud
+          NEXTCLOUD_ADMIN_USER: admin
+          NEXTCLOUD_ADMIN_PASSWORD: adminpass123
+          NEXTCLOUD_TRUSTED_DOMAINS: localhost 127.0.0.1
+        # The image has no HEALTHCHECK, so the readiness gate is a step below
+        # rather than `options: --health-cmd`.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Install fuse3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+
+      # Wait for the install to finish, not merely for the port to open:
+      # Nextcloud answers HTTP long before WebDAV works.
+      - name: Wait for Nextcloud
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -u admin:adminpass123 -X PROPFIND -H 'Depth: 0' \
+              http://127.0.0.1:8080/remote.php/dav/files/admin/ || true)
+            if [ "$code" = "207" ]; then
+              echo "Nextcloud ready after ~$((i*5))s"
+              exit 0
+            fi
+            echo "  waiting (http $code)"
+            sleep 5
+          done
+          echo "::error::Nextcloud did not become ready"
+          exit 1
+
+      - name: Tests against Nextcloud
+        env:
+          DAVFS_NEXTCLOUD_URL: http://127.0.0.1:8080
+          DAVFS_NEXTCLOUD_USER: admin
+          DAVFS_NEXTCLOUD_PASS: adminpass123
+          # Turn "no Nextcloud configured -> skip" into a failure.
+          DAVFS_NEXTCLOUD_REQUIRE: "1"
+          DAVFS_E2E_REQUIRE: "1"
+          RUST_LOG: davfs_sync=debug
+        # Serialized: the mount test takes /dev/fuse, and Nextcloud locks a
+        # collection while it is being modified.
+        run: cargo nextest run --locked --features testing --test nextcloud_live --test-threads 1
+
+      - name: Nextcloud log on failure
+        if: failure()
+        run: docker logs "${{ job.services.nextcloud.id }}" 2>&1 | tail -100
+
+      - name: Sweep leaked mounts
+        if: always()
+        run: |
+          awk '$3 ~ /^fuse/ { print $2 }' /proc/self/mounts | while read -r m; do
+            fusermount3 -uz "$m" || true
+          done
+
   # Real FUSE mounts. MUST be a VM job: /dev/fuse is absent in `container:` jobs
   # unless they add --device /dev/fuse --cap-add SYS_ADMIN.
   e2e:

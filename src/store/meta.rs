@@ -522,19 +522,6 @@ impl MetaStore {
         Ok(rows.into_iter().map(NodeId).collect())
     }
 
-    /// Cached blobs that are no longer the current version of their node.
-    pub async fn superseded_blobs(&self) -> Result<Vec<(NodeId, String)>> {
-        let rows = sqlx::query(
-            "SELECT remote_id, content_key FROM nodes \
-             WHERE content_key IS NOT NULL AND validator IS NOT NULL \
-               AND content_validator IS NOT DISTINCT FROM validator = 0",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .unwrap_or_default();
-        Ok(rows.iter().map(|r| (NodeId(r.get(0)), r.get(1))).collect())
-    }
-
     /// Blob keys eligible for eviction, least recently used first.
     ///
     /// Pinned nodes and anything with unsynced local changes are excluded.
@@ -551,6 +538,37 @@ impl MetaStore {
             .iter()
             .map(|r| (NodeId(r.get(0)), r.get(1), r.get::<i64, _>(2) as u64))
             .collect())
+    }
+
+    /// Every blob key the database currently points at.
+    ///
+    /// Used to find orphans on disk, which can only come from a crash between
+    /// the blob rename and the row update.
+    pub async fn all_content_keys(&self) -> Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT content_key FROM nodes WHERE content_key IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Forget directory listings not touched within `keep`.
+    ///
+    /// Only the listing is dropped, not the nodes: the next access revalidates
+    /// but inodes and any cached content survive. Startup-only, because pruning
+    /// while FUSE traffic flows races the kernel's dentry cache.
+    pub async fn prune_unlisted(&self, keep: Duration) -> Result<usize> {
+        let cutoff = self.clock.now_secs() - keep.as_secs() as i64;
+        let n = sqlx::query(
+            "UPDATE nodes SET listed_at = NULL WHERE kind = ? AND listed_at IS NOT NULL \
+             AND listed_at < ?",
+        )
+        .bind(kind_to_i64(NodeKind::Dir))
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n as usize)
     }
 
     pub async fn total_content_bytes(&self) -> Result<u64> {
