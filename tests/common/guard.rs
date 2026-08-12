@@ -47,6 +47,13 @@ pub struct MountGuard {
     /// Only set when the server is ours to shut down; a Nextcloud container
     /// outlives the test.
     _server: Option<RcloneServer>,
+    /// Directories that must outlive the mount: the metadata database, the
+    /// blob cache, and the fixture tree the server is serving.
+    ///
+    /// They belong here rather than being leaked with `std::mem::forget`.
+    /// Leaking them left ~3 directories per test behind in /tmp -- including an
+    /// 8 MiB fixture file each -- which reached 1.7 GB over a day's runs.
+    _dirs: Vec<TempDir>,
 }
 
 impl MountGuard {
@@ -59,6 +66,7 @@ impl MountGuard {
             session: Some(session),
             mountpoint,
             _server: Some(server),
+            _dirs: Vec::new(),
         }
     }
 
@@ -68,7 +76,14 @@ impl MountGuard {
             session: Some(session),
             mountpoint,
             _server: None,
+            _dirs: Vec::new(),
         }
+    }
+
+    /// Hand the guard ownership of directories that must outlive the mount.
+    pub fn owning(mut self, dirs: Vec<TempDir>) -> Self {
+        self._dirs = dirs;
+        self
     }
 
     pub fn path(&self) -> PathBuf {

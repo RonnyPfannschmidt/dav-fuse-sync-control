@@ -318,9 +318,7 @@ async fn mount(nc: &common::nextcloud::Nextcloud) -> MountGuard {
         "the mount never appeared"
     );
 
-    std::mem::forget(data);
-    std::mem::forget(cache);
-    MountGuard::without_server(session, mountpoint)
+    MountGuard::without_server(session, mountpoint).owning(vec![data, cache])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

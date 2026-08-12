@@ -64,8 +64,6 @@ macro_rules! require_fuse {
 async fn mount() -> MountGuard {
     let fixture = tree::build().expect("fixture tree");
     let server = RcloneServer::start(fixture.path()).expect("rclone");
-    // The fixture directory must outlive the server.
-    std::mem::forget(fixture);
 
     let client = WebDavClient::new(
         server.base.to_string(),
@@ -111,12 +109,9 @@ async fn mount() -> MountGuard {
         "the mount never appeared"
     );
 
-    // These outlive the test through the guard's server field only; leak the
-    // rest deliberately rather than complicating the guard.
-    std::mem::forget(data);
-    std::mem::forget(cache);
-
-    MountGuard::new(session, mountpoint, server)
+    // The guard owns everything that must outlive the mount, so a test run
+    // leaves nothing behind in /tmp.
+    MountGuard::new(session, mountpoint, server).owning(vec![fixture, data, cache])
 }
 
 /// The runtime must be multi-threaded: the FUSE session runs on its own thread
