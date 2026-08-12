@@ -6,10 +6,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::cache;
 use crate::config::MountConfig;
 use crate::filesystem::DavFS;
 use crate::secrets;
+use crate::store::MetaStore;
 use crate::webdav;
 
 #[derive(Parser)]
@@ -122,10 +122,7 @@ async fn setup_mount(
 }
 
 /// Perform initial sync: recursive PROPFIND and cache population
-async fn initial_sync(
-    webdav: &webdav::WebDavClient,
-    cache: &cache::DirectoryCache,
-) -> Result<usize> {
+async fn initial_sync(webdav: &webdav::WebDavClient, cache: &MetaStore) -> Result<usize> {
     tracing::info!("Starting recursive prefetch (depth=3)...");
 
     // Single recursive PROPFIND request with depth limit
@@ -242,8 +239,7 @@ async fn mount_filesystem(name: String) -> Result<()> {
 
     // Initialize cache (must happen in async context)
     println!("Initializing cache...");
-    let cache =
-        cache::DirectoryCache::new(&cache_db_path, std::time::Duration::from_secs(5)).await?;
+    let cache = MetaStore::new(&cache_db_path, std::time::Duration::from_secs(5)).await?;
     println!("✓ Cache initialized");
 
     // Perform initial sync before creating filesystem
@@ -259,7 +255,12 @@ async fn mount_filesystem(name: String) -> Result<()> {
     }
 
     // Create filesystem with populated cache
-    let fs = DavFS::new(webdav, cache);
+    let fs = DavFS::new(
+        tokio::runtime::Handle::current(),
+        webdav,
+        cache,
+        crate::fuse::OwnerIds::current(),
+    );
 
     println!(
         "\nMounting filesystem at {}...",

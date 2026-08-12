@@ -1,15 +1,15 @@
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyXattr,
-    Request,
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyXattr, Request,
 };
 use libc::ENOENT;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use crate::cache::DirectoryCache;
-use crate::webdav::WebDavClient;
+use crate::fuse::attr::{to_file_attr, NodeMeta, OwnerIds};
+use crate::store::MetaStore;
+use crate::webdav::{DavEntry, WebDavClient};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -17,19 +17,33 @@ const ROOT_INO: u64 = 1;
 
 pub struct DavFS {
     webdav: WebDavClient,
+    /// Captured explicitly rather than relying on `Handle::current()`.
+    ///
+    /// The PoC's FUSE callbacks called `Handle::current()`, which only worked
+    /// because `mount2` happened to be invoked inside `spawn_blocking`. Mounting
+    /// from a plain thread would panic, and a `current_thread` runtime would
+    /// deadlock -- which made the filesystem untestable.
+    rt: tokio::runtime::Handle,
+    /// Ownership reported for every node.
+    owner: OwnerIds,
     // Map inode to path
     inode_to_path: Arc<Mutex<HashMap<u64, String>>>,
     // Map path to inode
     path_to_inode: Arc<Mutex<HashMap<String, u64>>>,
     next_inode: Arc<Mutex<u64>>,
     // Directory listing cache
-    dir_cache: DirectoryCache,
+    dir_cache: MetaStore,
     // Track paths currently being refreshed to avoid duplicates
     refresh_in_progress: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DavFS {
-    pub fn new(webdav: WebDavClient, dir_cache: DirectoryCache) -> Self {
+    pub fn new(
+        rt: tokio::runtime::Handle,
+        webdav: WebDavClient,
+        dir_cache: MetaStore,
+        owner: OwnerIds,
+    ) -> Self {
         let mut inode_to_path = HashMap::new();
         let path_to_inode = HashMap::new();
 
@@ -38,6 +52,8 @@ impl DavFS {
 
         Self {
             webdav,
+            rt,
+            owner,
             inode_to_path: Arc::new(Mutex::new(inode_to_path)),
             path_to_inode: Arc::new(Mutex::new(path_to_inode)),
             next_inode: Arc::new(Mutex::new(2)),
@@ -59,7 +75,7 @@ impl DavFS {
         }
 
         // Check if cache is fresh (within TTL) - no need to refresh
-        let handle = tokio::runtime::Handle::current();
+        let handle = &self.rt;
         if handle.block_on(self.dir_cache.get(path)).is_some() {
             tracing::debug!("Cache is fresh for {}, skipping refresh", path);
             return false;
@@ -137,7 +153,7 @@ impl DavFS {
             fn prefetch_recursive(
                 rt: &tokio::runtime::Runtime,
                 webdav: &crate::webdav::WebDavClient,
-                cache: &crate::cache::DirectoryCache,
+                cache: &crate::store::MetaStore,
                 path: &str,
                 depth: u32,
                 max_depth: u32,
@@ -241,64 +257,17 @@ impl DavFS {
         inode_to_path.get(&ino).cloned()
     }
 
-    fn root_attr() -> FileAttr {
-        FileAttr {
-            ino: ROOT_INO,
-            size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::Directory,
-            perm: 0o755,
-            nlink: 2,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-
-    fn dir_attr(ino: u64) -> FileAttr {
-        FileAttr {
-            ino,
-            size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::Directory,
-            perm: 0o755,
-            nlink: 2,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
-    }
-
-    fn file_attr(ino: u64, size: u64) -> FileAttr {
-        FileAttr {
-            ino,
-            size,
-            blocks: size.div_ceil(512),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::RegularFile,
-            perm: 0o644,
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
-        }
+    /// Attributes for a directory entry, carrying its real mtime.
+    fn attr_for(&self, ino: u64, entry: &DavEntry) -> fuser::FileAttr {
+        let meta = if entry.is_dir {
+            NodeMeta::dir(ino)
+        } else {
+            NodeMeta::file(ino, entry.size)
+        };
+        to_file_attr(
+            &meta.with_mtime(entry.modified.map(|dt| dt.timestamp())),
+            self.owner,
+        )
     }
 }
 
@@ -330,8 +299,7 @@ impl Filesystem for DavFS {
         };
 
         // Always try cache first (even stale), schedule background refresh if needed
-        let entries = if let Some(cached) =
-            tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(&parent_path))
+        let entries = if let Some(cached) = self.rt.block_on(self.dir_cache.get_stale(&parent_path))
         {
             tracing::debug!("Serving lookup from cache: {}", parent_path);
 
@@ -347,11 +315,12 @@ impl Filesystem for DavFS {
             } else {
                 &parent_path[1..]
             };
-            match tokio::runtime::Handle::current()
+            match self
+                .rt
                 .block_on(self.webdav.list_dir_with_etag(dav_path, None))
             {
                 Ok((entries, etag)) => {
-                    let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(
+                    let _ = self.rt.block_on(self.dir_cache.insert(
                         parent_path.clone(),
                         entries.clone(),
                         etag,
@@ -368,11 +337,7 @@ impl Filesystem for DavFS {
         for entry in entries {
             if entry.name == name_str {
                 let ino = self.get_or_create_inode(&full_path);
-                let attr = if entry.is_dir {
-                    Self::dir_attr(ino)
-                } else {
-                    Self::file_attr(ino, entry.size)
-                };
+                let attr = self.attr_for(ino, &entry);
                 reply.entry(&TTL, &attr, 0);
                 return;
             }
@@ -384,7 +349,7 @@ impl Filesystem for DavFS {
         tracing::debug!("getattr: ino={}", ino);
 
         if ino == ROOT_INO {
-            reply.attr(&TTL, &Self::root_attr());
+            reply.attr(&TTL, &to_file_attr(&NodeMeta::dir(ROOT_INO), self.owner));
             return;
         }
 
@@ -410,8 +375,7 @@ impl Filesystem for DavFS {
         let name = path.rsplit('/').next().unwrap_or("");
 
         // Always try cache first (even stale), schedule background refresh if needed
-        let entries = if let Some(cached) =
-            tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(parent_path))
+        let entries = if let Some(cached) = self.rt.block_on(self.dir_cache.get_stale(parent_path))
         {
             tracing::debug!("Serving getattr from cache: {}", parent_path);
 
@@ -427,11 +391,12 @@ impl Filesystem for DavFS {
             } else {
                 &parent_path[1..]
             };
-            match tokio::runtime::Handle::current()
+            match self
+                .rt
                 .block_on(self.webdav.list_dir_with_etag(dav_path, None))
             {
                 Ok((entries, etag)) => {
-                    let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(
+                    let _ = self.rt.block_on(self.dir_cache.insert(
                         parent_path.to_string(),
                         entries.clone(),
                         etag,
@@ -440,7 +405,7 @@ impl Filesystem for DavFS {
                 }
                 Err(_) => {
                     // Fallback to generic file attributes
-                    let attr = Self::file_attr(ino, 1024);
+                    let attr = to_file_attr(&NodeMeta::file(ino, 1024), self.owner);
                     reply.attr(&TTL, &attr);
                     return;
                 }
@@ -449,11 +414,7 @@ impl Filesystem for DavFS {
 
         for entry in entries {
             if entry.name == name {
-                let attr = if entry.is_dir {
-                    Self::dir_attr(ino)
-                } else {
-                    Self::file_attr(ino, entry.size)
-                };
+                let attr = self.attr_for(ino, &entry);
                 reply.attr(&TTL, &attr);
                 return;
             }
@@ -488,52 +449,52 @@ impl Filesystem for DavFS {
         let dav_path = if dir_path == "/" { "" } else { &dir_path[1..] };
 
         // Always try cache first (even stale), schedule background refresh if needed
-        let dav_entries = if let Some(cached) =
-            tokio::runtime::Handle::current().block_on(self.dir_cache.get_stale(&dir_path))
-        {
-            tracing::debug!("Serving readdir from cache: {}", dir_path);
+        let dav_entries =
+            if let Some(cached) = self.rt.block_on(self.dir_cache.get_stale(&dir_path)) {
+                tracing::debug!("Serving readdir from cache: {}", dir_path);
 
-            // Schedule background refresh (deduplicates automatically)
-            self.schedule_refresh(&dir_path);
+                // Schedule background refresh (deduplicates automatically)
+                self.schedule_refresh(&dir_path);
 
-            cached
-        } else {
-            // No cache at all, must fetch synchronously (fallback)
-            tracing::info!("No cache for {}, fetching synchronously", dir_path);
-            match tokio::runtime::Handle::current()
-                .block_on(self.webdav.list_dir_with_etag(dav_path, None))
-            {
-                Ok((entries, etag)) => {
-                    tracing::info!(
-                        "Listed {} entries from WebDAV at path {} with etag: {:?}",
-                        entries.len(),
-                        dav_path,
-                        etag
-                    );
-                    let _ = tokio::runtime::Handle::current().block_on(self.dir_cache.insert(
-                        dir_path.clone(),
-                        entries.clone(),
-                        etag,
-                    ));
+                cached
+            } else {
+                // No cache at all, must fetch synchronously (fallback)
+                tracing::info!("No cache for {}, fetching synchronously", dir_path);
+                match self
+                    .rt
+                    .block_on(self.webdav.list_dir_with_etag(dav_path, None))
+                {
+                    Ok((entries, etag)) => {
+                        tracing::info!(
+                            "Listed {} entries from WebDAV at path {} with etag: {:?}",
+                            entries.len(),
+                            dav_path,
+                            etag
+                        );
+                        let _ = self.rt.block_on(self.dir_cache.insert(
+                            dir_path.clone(),
+                            entries.clone(),
+                            etag,
+                        ));
 
-                    // Note: prefetch_subdirectories disabled - initial prefetch + on-demand refresh is sufficient
+                        // Note: prefetch_subdirectories disabled - initial prefetch + on-demand refresh is sufficient
 
-                    entries
-                }
-                Err(e) => {
-                    tracing::error!("Failed to list directory: {}", e);
-
-                    // Still return . and ..
-                    for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-                        if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
-                            break;
-                        }
+                        entries
                     }
-                    reply.ok();
-                    return;
+                    Err(e) => {
+                        tracing::error!("Failed to list directory: {}", e);
+
+                        // Still return . and ..
+                        for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+                            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+                                break;
+                            }
+                        }
+                        reply.ok();
+                        return;
+                    }
                 }
-            }
-        };
+            };
 
         let mut all_entries = entries;
 
@@ -629,15 +590,9 @@ impl Filesystem for DavFS {
             "cached"
         } else if path.ends_with('/') {
             // It's a directory - check if we have fresh cache
-            if tokio::runtime::Handle::current()
-                .block_on(self.dir_cache.get(&path))
-                .is_some()
-            {
+            if self.rt.block_on(self.dir_cache.get(&path)).is_some() {
                 "cached" // Fresh cache
-            } else if tokio::runtime::Handle::current()
-                .block_on(self.dir_cache.get_stale(&path))
-                .is_some()
-            {
+            } else if self.rt.block_on(self.dir_cache.get_stale(&path)).is_some() {
                 "cloud" // Stale cache, needs refresh
             } else {
                 "unknown" // No cache at all
@@ -654,13 +609,11 @@ impl Filesystem for DavFS {
                 "/"
             };
 
-            if tokio::runtime::Handle::current()
-                .block_on(self.dir_cache.get(parent_path))
-                .is_some()
-            {
+            if self.rt.block_on(self.dir_cache.get(parent_path)).is_some() {
                 // Parent has fresh cache, file metadata is known but content not downloaded
                 "cloud"
-            } else if tokio::runtime::Handle::current()
+            } else if self
+                .rt
                 .block_on(self.dir_cache.get_stale(parent_path))
                 .is_some()
             {
