@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use secret_service::SecretService;
 use secret_service::EncryptionType;
+use secret_service::SecretService;
 use std::collections::HashMap;
 
 use crate::config::MountConfig;
@@ -20,8 +20,9 @@ impl SecretStore {
 
     pub async fn store_mount_config(&self, name: &str, config: &MountConfig) -> Result<()> {
         let config_json = serde_json::to_string(config)?;
-        
-        let collection = self.service
+
+        let collection = self
+            .service
             .get_default_collection()
             .await
             .context("Failed to get default collection")?;
@@ -46,7 +47,8 @@ impl SecretStore {
     }
 
     pub async fn load_mount_config(&self, name: &str) -> Result<MountConfig> {
-        let collection = self.service
+        let collection = self
+            .service
             .get_default_collection()
             .await
             .context("Failed to get default collection")?;
@@ -61,20 +63,17 @@ impl SecretStore {
             .await
             .context("Failed to search for config")?;
 
-        let item = items
-            .first()
-            .context("Mount config not found")?;
+        let item = items.first().context("Mount config not found")?;
 
-        let secret = item.get_secret()
-            .await
-            .context("Failed to get secret")?;
-        
+        let secret = item.get_secret().await.context("Failed to get secret")?;
+
         let config: MountConfig = serde_json::from_str(&String::from_utf8(secret)?)?;
         Ok(config)
     }
 
     pub async fn store_password(&self, name: &str, password: &str) -> Result<()> {
-        let collection = self.service
+        let collection = self
+            .service
             .get_default_collection()
             .await
             .context("Failed to get default collection")?;
@@ -99,7 +98,8 @@ impl SecretStore {
     }
 
     pub async fn load_password(&self, name: &str) -> Result<String> {
-        let collection = self.service
+        let collection = self
+            .service
             .get_default_collection()
             .await
             .context("Failed to get default collection")?;
@@ -114,19 +114,53 @@ impl SecretStore {
             .await
             .context("Failed to search for password")?;
 
-        let item = items
-            .first()
-            .context("Password not found")?;
+        let item = items.first().context("Password not found")?;
 
-        let secret = item.get_secret()
-            .await
-            .context("Failed to get secret")?;
-        
+        let secret = item.get_secret().await.context("Failed to get secret")?;
+
         Ok(String::from_utf8(secret)?)
     }
 
+    /// Look for a password stored by Nextcloud Desktop.
+    ///
+    /// Nextcloud Desktop uses several different attribute combinations
+    /// depending on version and desktop environment, so try each in turn.
+    pub async fn find_nextcloud_password(&self, username: &str) -> Result<String> {
+        let collection = self
+            .service
+            .get_default_collection()
+            .await
+            .context("Failed to get default collection")?;
+
+        let search_patterns: Vec<Vec<(&str, &str)>> = vec![
+            vec![("application", "Nextcloud"), ("user", username)],
+            vec![
+                ("application", "org.kde.kwalletd5"),
+                ("folder", "Nextcloud"),
+            ],
+            vec![("application", "Nextcloud Desktop")],
+        ];
+
+        for pattern in search_patterns {
+            let attrs: HashMap<&str, &str> = pattern.into_iter().collect();
+
+            if let Ok(items) = collection.search_items(attrs).await {
+                if let Some(item) = items.first() {
+                    if let Ok(secret) = item.get_secret().await {
+                        if let Ok(password) = String::from_utf8(secret) {
+                            return Ok(password);
+                        }
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("Password not found in keyring")
+    }
+
     pub async fn list_mounts(&self) -> Result<Vec<String>> {
-        let collection = self.service
+        let collection = self
+            .service
             .get_default_collection()
             .await
             .context("Failed to get default collection")?;
@@ -142,7 +176,8 @@ impl SecretStore {
 
         let mut mount_names = Vec::new();
         for item in items {
-            let attrs = item.get_attributes()
+            let attrs = item
+                .get_attributes()
                 .await
                 .context("Failed to get attributes")?;
             if let Some(name) = attrs.get("mount") {

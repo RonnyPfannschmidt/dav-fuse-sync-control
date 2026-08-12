@@ -2,17 +2,42 @@
 name = "davfs-sync"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
+description = "WebDAV FUSE filesystem with offline metadata cache and sync control"
+repository = "https://github.com/RonnyPfannschmidt/dav-fuse-sync-control"
+license = "MIT OR Apache-2.0"
+
+# Integration tests cannot import a binary target, so the crate must expose a
+# library. Everything lives in the lib; the bin is a thin entry point.
+[lib]
+name = "davfs_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "davfs-sync"
+path = "src/main.rs"
 
 [dependencies]
-# FUSE implementation
-fuser = "0.14"
+# FUSE implementation.
+# default-features = false drops the `libfuse` feature, and with it the
+# pkg-config build dependency -- which is what .cargo/config.toml used to exist
+# to satisfy. fuser then uses its pure-Rust mount path and shells out to the
+# `fusermount3` binary at runtime.
+fuser = { version = "0.14", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP/WebDAV client
-reqwest = { version = "0.12", features = ["json"] }
-http = "1.0"
+# HTTP/WebDAV client.
+# rustls rather than the default native-tls: it removes the only system library
+# dependency (openssl-sys) from the build.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "http2",
+    "charset",
+    "stream",
+] }
 url = "2.5"
 urlencoding = "2.1"
 
@@ -22,13 +47,14 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
-# Secret storage (GNOME Keyring / Secret Service)
+# Secret storage (GNOME Keyring / Secret Service).
+# The rt-tokio-crypto-rust feature keeps this pure Rust (zbus), so there is no
+# libdbus-1 build dependency.
 secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
 
 # Logging
 tracing = "0.1"
@@ -47,3 +73,6 @@ dirs = "5.0"
 
 # Password input
 rpassword = "7.3"
+
+[dev-dependencies]
+tempfile = "3"

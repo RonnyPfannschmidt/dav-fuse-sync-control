@@ -1,0 +1,3 @@
+# Tree-wide rustfmt + mechanical clippy fixes.
+# Use: git config blame.ignoreRevsFile .git-blame-ignore-revs
+233ec2831c6fd89d756914b968b972f21abf3fe5

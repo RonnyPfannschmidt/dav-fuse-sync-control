@@ -1,6 +1,8 @@
 # Ignore build outputs
 /target/
-Cargo.lock
+
+# Cargo.lock IS committed: this is a binary crate, so the lockfile is the
+# difference between reproducible releases and "worked on my machine".
 
 # Editor files
 .vscode/
