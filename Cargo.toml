@@ -28,6 +28,10 @@ fuser = { version = "0.18", default-features = false }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+rand = "0.9"
 
 # HTTP/WebDAV client.
 # rustls rather than the default native-tls: it removes the only system library
@@ -79,6 +83,12 @@ dirs = "5.0"
 # Password input
 rpassword = "7.3"
 
+[features]
+# Exposes MockRemote to integration tests without shipping it in the binary.
+testing = []
+
 [dev-dependencies]
+# Self-dependency so `tests/` sees the `testing` feature. The standard idiom.
+davfs-sync = { path = ".", features = ["testing"] }
 tempfile = "3"
 insta = { version = "1", features = ["yaml", "filters"] }

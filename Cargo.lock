@@ -488,8 +488,11 @@ name = "davfs-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "bytes",
  "chrono",
  "clap",
+ "davfs-sync",
  "dirs",
  "fuser",
  "futures",
@@ -497,6 +500,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "quick-xml",
+ "rand 0.9.2",
  "reqwest",
  "rpassword",
  "secret-service",
@@ -506,6 +510,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",

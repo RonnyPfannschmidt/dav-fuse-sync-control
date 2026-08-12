@@ -10,8 +10,15 @@ pub mod creds;
 pub mod error;
 pub mod filesystem;
 pub mod fuse;
+pub mod remote;
 pub mod secrets;
 pub mod store;
-pub mod webdav;
 
 pub use error::RemoteError;
+pub use remote::{NodeId, RemoteEntry, RemoteStorage};
+
+/// Compatibility path for the WebDAV client, which now lives behind the seam.
+pub mod webdav {
+    pub use crate::remote::propfind;
+    pub use crate::remote::webdav::*;
+}

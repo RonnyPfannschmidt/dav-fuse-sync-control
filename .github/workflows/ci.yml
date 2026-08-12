@@ -23,7 +23,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --features testing -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -36,7 +36,7 @@ jobs:
       # No fuse3 and no rclone here: these tiers deliberately need neither, so
       # a broken runner image cannot silently disable them.
       - name: Unit, parser and cache tests
-        run: cargo nextest run --locked --lib --bins --test propfind
+        run: cargo nextest run --locked --features testing --lib --bins --test propfind
 
       - run: cargo test --locked --doc
 
@@ -72,7 +72,7 @@ jobs:
           # Turns "rclone missing -> skip" into a hard failure, so a runner
           # image regression shows up red rather than green-with-skips.
           DAVFS_E2E_REQUIRE: "1"
-        run: cargo nextest run --locked --test webdav_live
+        run: cargo nextest run --locked --features testing --test webdav_live --test remote_seam
 
       - name: Clean up stray rclone processes
         if: always()
